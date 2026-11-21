@@ -1,0 +1,669 @@
+//! Compressed token radix index with exact state endpoints and byte accounting.
+mod tiered;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+pub(crate) use tiered::{Admission, Tiered};
+
+#[derive(Default, Debug, Clone, Serialize)]
+pub struct Statistics {
+    pub cached_tokens: usize,
+    pub matched_tokens: usize,
+    pub lookup_s: f64,
+    pub restore_s: f64,
+    pub store_s: f64,
+    pub resident_bytes: usize,
+    pub logical_bytes: usize,
+    pub shared_bytes: usize,
+    pub entries: usize,
+    pub evictions: usize,
+    pub checkpoints_stored: usize,
+    /// CPU tier, summed across all tensor-parallel workers.
+    pub host_resident_bytes: usize,
+    pub host_entries: usize,
+    pub host_hits: usize,
+    pub host_stores: usize,
+    pub host_evictions: usize,
+}
+
+/// Image identities are scoped to the first affected token, not the request.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Media(pub Vec<(usize, [u8; 32])>);
+pub(crate) fn hash_floats(hash: &mut Sha256, values: &[f32]) {
+    let (chunks, tail) = values.as_chunks::<256>();
+    for chunk in chunks {
+        hash.update(chunk.map(f32::to_le_bytes).as_flattened());
+    }
+    for value in tail {
+        hash.update(value.to_le_bytes());
+    }
+}
+impl Media {
+    pub fn images(
+        input: &[u32],
+        images: &[crate::vision::ImageInput],
+        vision: Option<&crate::vision::VisionSpec>,
+    ) -> crate::artifact::Result<Self> {
+        let Some(vision) = vision else {
+            return if images.is_empty() {
+                Ok(Self::default())
+            } else {
+                Err("Model has no image adapter".into())
+            };
+        };
+        let spans = vision.image_spans(input, images)?;
+        let mut media = Vec::with_capacity(images.len());
+        for (image, span) in images.iter().zip(spans) {
+            let mut hash = Sha256::new();
+            hash.update((image.grid_height as u64).to_le_bytes());
+            hash.update((image.grid_width as u64).to_le_bytes());
+            if image.rgb.is_empty() {
+                hash_floats(&mut hash, &image.pixels);
+            } else {
+                hash.update(b"rgb8");
+                hash.update(&image.rgb);
+            }
+            media.push((span.start, hash.finalize().into()));
+        }
+        Ok(Self(media))
+    }
+    pub fn common_tokens(&self, other: &Self, limit: usize) -> usize {
+        let mut left = self.0.iter().filter(|(p, _)| *p < limit);
+        let mut right = other.0.iter().filter(|(p, _)| *p < limit);
+        loop {
+            match (left.next(), right.next()) {
+                (None, None) => return limit,
+                (Some(a), Some(b)) if a == b => (),
+                (Some(a), Some(b)) => return a.0.min(b.0),
+                (Some(a), None) | (None, Some(a)) => return a.0,
+            }
+        }
+    }
+}
+
+/// Account physical allocations once even when many endpoints share KV ranges.
+pub(crate) trait Resident {
+    fn allocations(&self, out: &mut BTreeMap<u64, usize>);
+}
+pub(crate) struct Entry<T> {
+    pub tokens: Vec<u32>,
+    pub media: Media,
+    pub snapshot: T,
+    pub bytes: usize,
+    pub warm_tokens: usize,
+    /// A decoded endpoint may have valid state but no matching target head.
+    pub logits_valid: bool,
+    used: u64,
+    hits: u64,
+}
+impl<T> Entry<T> {
+    /// Preserve reuse history and endpoint identity when changing storage tier.
+    pub fn replace_snapshot<U>(self, snapshot: U) -> (Entry<U>, T) {
+        (
+            Entry {
+                tokens: self.tokens,
+                media: self.media,
+                snapshot,
+                bytes: self.bytes,
+                warm_tokens: self.warm_tokens,
+                logits_valid: self.logits_valid,
+                used: self.used,
+                hits: self.hits,
+            },
+            self.snapshot,
+        )
+    }
+    pub fn new(
+        tokens: Vec<u32>,
+        media: Media,
+        snapshot: T,
+        bytes: usize,
+        warm_tokens: usize,
+        logits_valid: bool,
+    ) -> Self {
+        Self {
+            tokens,
+            media,
+            snapshot,
+            bytes,
+            warm_tokens,
+            logits_valid,
+            used: 0,
+            hits: 0,
+        }
+    }
+}
+
+#[derive(Default)]
+struct Node {
+    label: Vec<u32>,
+    endpoints: Vec<u64>,
+    children: BTreeMap<u32, Node>,
+}
+impl Node {
+    fn insert(&mut self, tokens: &[u32], id: u64) {
+        if tokens.is_empty() {
+            self.endpoints.push(id);
+            return;
+        }
+        let child = self.children.entry(tokens[0]).or_default();
+        if child.label.is_empty() {
+            child.label = tokens.to_vec();
+            child.endpoints.push(id);
+            return;
+        }
+        let common = child
+            .label
+            .iter()
+            .zip(tokens)
+            .take_while(|(a, b)| a == b)
+            .count();
+        if common < child.label.len() {
+            let mut tail = std::mem::take(child);
+            child.label = tail.label.drain(..common).collect();
+            child.children.insert(tail.label[0], tail);
+        }
+        child.insert(&tokens[common..], id);
+    }
+    fn remove(&mut self, tokens: &[u32], id: u64) {
+        if tokens.is_empty() {
+            self.endpoints.retain(|&e| e != id);
+            return;
+        }
+        let key = tokens[0];
+        if let Some(child) = self.children.get_mut(&key) {
+            child.remove(&tokens[child.label.len()..], id);
+            if child.endpoints.is_empty() && child.children.len() == 1 {
+                let (_, tail) = child.children.pop_first().expect("one child");
+                child.label.extend(tail.label);
+                child.endpoints = tail.endpoints;
+                child.children = tail.children;
+            }
+            if child.endpoints.is_empty() && child.children.is_empty() {
+                self.children.remove(&key);
+            }
+        }
+    }
+    fn descendants(&self, ids: &mut Vec<u64>) {
+        ids.extend(&self.endpoints);
+        for child in self.children.values() {
+            child.descendants(ids);
+        }
+    }
+}
+#[derive(Default, Debug, PartialEq, Eq)]
+pub(crate) struct Match {
+    pub checkpoint: Option<u64>,
+    pub matched_tokens: usize,
+}
+pub(crate) struct Cache<T> {
+    pub budget: usize,
+    pub bytes: usize,
+    pub entries: BTreeMap<u64, Entry<T>>,
+    root: Node,
+    clock: u64,
+    next_id: u64,
+}
+impl<T: Resident> Cache<T> {
+    pub fn new(budget: usize) -> Self {
+        Self {
+            budget,
+            bytes: 0,
+            entries: BTreeMap::new(),
+            root: Node::default(),
+            clock: 0,
+            next_id: 0,
+        }
+    }
+    pub fn match_prefix_by(
+        &self,
+        tokens: &[u32],
+        media: &Media,
+        score: impl Fn(&Entry<T>) -> Option<f64>,
+    ) -> Match {
+        let mut result = Match::default();
+        let mut best = f64::INFINITY;
+        let (mut node, mut depth) = (&self.root, 0);
+        loop {
+            for id in &node.endpoints {
+                let e = &self.entries[id];
+                let common = e.media.common_tokens(media, depth);
+                result.matched_tokens = result.matched_tokens.max(common);
+                if common == depth
+                    && (depth < tokens.len() || e.logits_valid)
+                    && let Some(cost) = score(e)
+                    && cost <= best
+                {
+                    result.checkpoint = Some(*id);
+                    best = cost;
+                }
+            }
+            let child = tokens.get(depth).and_then(|id| node.children.get(id));
+            // A deeper token match can fail on an image identity. Off-path
+            // siblings may still provide a longer media-compatible overlap.
+            for (key, sibling) in &node.children {
+                if Some(key) == tokens.get(depth) {
+                    continue;
+                }
+                let mut ids = vec![];
+                sibling.descendants(&mut ids);
+                for id in ids {
+                    result.matched_tokens = result
+                        .matched_tokens
+                        .max(self.entries[&id].media.common_tokens(media, depth));
+                }
+            }
+            if let Some(child) = child {
+                let common = child
+                    .label
+                    .iter()
+                    .zip(&tokens[depth..])
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                depth += common;
+                if common == child.label.len() {
+                    node = child;
+                    continue;
+                }
+                node = child;
+            }
+            let mut descendants = vec![];
+            node.descendants(&mut descendants);
+            for id in descendants {
+                result.matched_tokens = result
+                    .matched_tokens
+                    .max(self.entries[&id].media.common_tokens(media, depth));
+            }
+            return result;
+        }
+    }
+    #[cfg(test)]
+    pub fn match_prefix(&self, tokens: &[u32], media: &Media) -> Match {
+        self.match_prefix_by(tokens, media, |e| Some(-(e.tokens.len() as f64)))
+    }
+    #[cfg(test)]
+    pub fn find(&self, tokens: &[u32], media: &Media) -> Option<u64> {
+        self.match_prefix(tokens, media).checkpoint
+    }
+    pub fn touch(&mut self, id: u64) -> &Entry<T> {
+        let e = self.mark_recent(id).expect("checked prefix id");
+        e.hits += 1;
+        e
+    }
+    pub fn mark_recent(&mut self, id: u64) -> Option<&mut Entry<T>> {
+        let e = self.entries.get_mut(&id)?;
+        self.clock += 1;
+        e.used = self.clock;
+        Some(e)
+    }
+    pub fn resident_with(&self, extra: Option<&dyn Resident>) -> usize {
+        let mut allocations = BTreeMap::new();
+        for e in self.entries.values() {
+            e.snapshot.allocations(&mut allocations);
+        }
+        if let Some(extra) = extra {
+            extra.allocations(&mut allocations);
+        }
+        allocations.values().sum()
+    }
+    pub fn update_statistics(&self, statistics: &mut Statistics) {
+        statistics.resident_bytes = self.bytes;
+        statistics.logical_bytes = self.entries.values().map(|e| e.bytes).sum();
+        statistics.shared_bytes = statistics.logical_bytes.saturating_sub(self.bytes);
+        statistics.entries = self.entries.len();
+    }
+    pub fn remove(&mut self, id: u64) -> Option<Entry<T>> {
+        let entry = self.entries.remove(&id)?;
+        self.root.remove(&entry.tokens, id);
+        self.bytes = self.resident_with(None);
+        Some(entry)
+    }
+    fn ancestor_depth(&self, entry: &Entry<T>) -> usize {
+        let (mut node, mut depth, mut best) = (&self.root, 0, 0);
+        while let Some(child) = entry.tokens.get(depth).and_then(|id| node.children.get(id)) {
+            depth += child.label.len();
+            if depth >= entry.tokens.len() {
+                break;
+            }
+            for id in &child.endpoints {
+                if self.entries[id].media.common_tokens(&entry.media, depth) == depth {
+                    best = depth;
+                }
+            }
+            node = child;
+        }
+        best
+    }
+    /// SegLen-style utility: saved replay distance per reclaimable byte,
+    /// discounted by age. Tombstoned parents are skipped when computing distance.
+    pub fn evict_one(&mut self) -> Option<T> {
+        self.evict_one_except(None)
+    }
+    /// A generated endpoint must not evict the prompt that makes repeating
+    /// that request useful. General memory admission may still evict any entry.
+    pub fn evict_one_except(&mut self, protected: Option<u64>) -> Option<T> {
+        self.evict_entry_one_except(protected).map(|e| e.snapshot)
+    }
+    /// Move an endpoint between storage tiers without losing its token identity.
+    pub fn evict_entry_one_except(&mut self, protected: Option<u64>) -> Option<Entry<T>> {
+        let victim = self.victim_except(protected)?;
+        self.remove(victim)
+    }
+    /// Select without unpublishing the source. Tier transfers commit removal
+    /// only after the adapter reports successful completion.
+    pub fn victim_except(&self, protected: Option<u64>) -> Option<u64> {
+        self.victim_with_priority(protected, false, |_| false)
+    }
+
+    /// GPU capture preserves live prompts first, then favors prompt
+    /// checkpoints and proven continuations over unproven generated tails.
+    pub fn victim_for_capture(&self, active_prompt: impl Fn(u64) -> bool) -> Option<u64> {
+        self.victim_with_priority(None, true, active_prompt)
+    }
+
+    fn victim_with_priority(
+        &self,
+        protected: Option<u64>,
+        prefer_unproven: bool,
+        active_prompt: impl Fn(u64) -> bool,
+    ) -> Option<u64> {
+        let mut references: BTreeMap<u64, (usize, usize)> = BTreeMap::new();
+        for e in self.entries.values() {
+            let mut own = BTreeMap::new();
+            e.snapshot.allocations(&mut own);
+            for (id, bytes) in own {
+                let r = references.entry(id).or_insert((bytes, 0));
+                r.1 += 1;
+            }
+        }
+        self.entries
+            .iter()
+            .filter(|(id, _)| Some(**id) != protected)
+            .min_by(|(id_a, a), (id_b, b)| {
+                let utility = |e: &Entry<T>| {
+                    let parent = self.ancestor_depth(e);
+                    let mut own = BTreeMap::new();
+                    e.snapshot.allocations(&mut own);
+                    let freed: usize = own
+                        .iter()
+                        .filter(|(id, _)| references[id].1 == 1)
+                        .map(|(_, n)| *n)
+                        .sum();
+                    (e.tokens.len() - parent).max(1) as f64 * (1.0 + e.hits as f64)
+                        / (freed.max(1) as f64 * (self.clock - e.used + 1) as f64)
+                };
+                let priority =
+                    |entry: &Entry<T>| prefer_unproven && (entry.logits_valid || entry.hits != 0);
+                active_prompt(**id_a)
+                    .cmp(&active_prompt(**id_b))
+                    .then_with(|| priority(a).cmp(&priority(b)))
+                    .then_with(|| utility(a).total_cmp(&utility(b)))
+                    .then(a.used.cmp(&b.used))
+            })
+            .map(|(&id, _)| id)
+    }
+    pub fn insert(&mut self, mut entry: Entry<T>) -> u64 {
+        self.clock += 1;
+        self.next_id += 1;
+        entry.used = self.clock;
+        self.root.insert(&entry.tokens, self.next_id);
+        self.entries.insert(self.next_id, entry);
+        self.bytes = self.resident_with(None);
+        debug_assert!(self.bytes <= self.budget);
+        self.next_id
+    }
+    #[cfg(test)]
+    pub fn clear(&mut self) -> Vec<T> {
+        self.root = Node::default();
+        self.bytes = 0;
+        std::mem::take(&mut self.entries)
+            .into_values()
+            .map(|e| e.snapshot)
+            .collect()
+    }
+}
+
+/// Device wins an equal token prefix. Model adapters supply state-validity and
+/// compute/transfer cost scores; neither tree needs device-specific policies.
+pub(crate) fn match_tiers<D: Resident, H: Resident>(
+    device: &Cache<D>,
+    host: &Cache<H>,
+    tokens: &[u32],
+    media: &Media,
+    device_score: impl Fn(&Entry<D>) -> Option<f64>,
+    host_score: impl Fn(&Entry<H>) -> Option<f64>,
+) -> Option<(bool, u64)> {
+    let d = device
+        .match_prefix_by(tokens, media, device_score)
+        .checkpoint;
+    let h = host.match_prefix_by(tokens, media, host_score).checkpoint;
+    match (d, h) {
+        (Some(d), Some(h)) if host.entries[&h].tokens.len() > device.entries[&d].tokens.len() => {
+            Some((true, h))
+        }
+        (Some(d), _) => Some((false, d)),
+        (_, h) => h.map(|id| (true, id)),
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn image_identity_preserves_text_prefix_and_separates_changed_or_reordered_images() {
+        let vision: crate::vision::VisionSpec = serde_json::from_value(serde_json::json!({
+            "layout":"deepseek_v41","max_image_tokens":1024,"hidden":5120,
+            "patch_size":14,"temporal_patch_size":1,"merge_size":3,"max_patches":9216,
+            "max_features":4096,"pixels":"p","grid":"g","length":"n","output":"o",
+            "features":"f","feature_index":"i","mrope_positions":"r",
+            "plans":[{"patches":9216,"program":"vision"}],"image_token_id":10,
+            "vision_start_token_id":10,"vision_end_token_id":10
+        }))
+        .unwrap();
+        let red = crate::vision::ImageInput {
+            grid_height: 2,
+            grid_width: 4,
+            rgb: vec![127; 2 * 4 * 14 * 14 * 3],
+            ..Default::default()
+        };
+        let mut blue = red.clone();
+        blue.rgb[0] = 128;
+        let images = [red.clone(), blue.clone()];
+        let tokens = vision.expand(&[1, 10, 2, 10, 3], &images, 32).unwrap();
+        let original = Media::images(&tokens, &images, Some(&vision)).unwrap();
+        let same = Media::images(&tokens, &images, Some(&vision)).unwrap();
+        let changed = Media::images(&tokens, &[red.clone(), red], Some(&vision)).unwrap();
+        let reversed = Media::images(&tokens, &[blue, images[0].clone()], Some(&vision)).unwrap();
+        assert_eq!(original, same);
+        assert_eq!(original.common_tokens(&same, tokens.len()), tokens.len());
+        assert_eq!(original.common_tokens(&changed, tokens.len()), 7);
+        assert_eq!(original.common_tokens(&reversed, tokens.len()), 1);
+        let mut invalid = tokens;
+        invalid[2] = 4;
+        assert!(Media::images(&invalid, &images, Some(&vision)).is_err());
+    }
+    #[test]
+    fn decoded_insertion_preserves_its_prompt_but_admission_can_reclaim_it() {
+        let mut cache = Cache::new(100);
+        let prompt = cache.insert(entry(&[1, 2], &[(1, 10)], true));
+        cache.insert(entry(&[1, 2, 3, 4, 5], &[(2, 10)], false));
+        assert!(cache.evict_one_except(Some(prompt)).is_some());
+        assert_eq!(cache.find(&[1, 2], &Media::default()), Some(prompt));
+        assert!(cache.evict_one_except(Some(prompt)).is_none());
+        assert_eq!(cache.bytes, 10);
+        assert!(cache.evict_one().is_some());
+        assert_eq!(cache.bytes, 0);
+    }
+    #[derive(Clone)]
+    struct Blocks(Vec<(u64, usize)>);
+    impl Resident for Blocks {
+        fn allocations(&self, out: &mut BTreeMap<u64, usize>) {
+            out.extend(self.0.iter().copied());
+        }
+    }
+    fn entry(tokens: &[u32], blocks: &[(u64, usize)], valid: bool) -> Entry<Blocks> {
+        Entry::new(
+            tokens.to_vec(),
+            Media::default(),
+            Blocks(blocks.to_vec()),
+            blocks.iter().map(|b| b.1).sum(),
+            tokens.len() - 1,
+            valid,
+        )
+    }
+    #[test]
+    fn capture_prefers_unproven_continuations_even_when_they_are_recent() {
+        let mut cache = Cache::new(100);
+        let prompt = cache.insert(entry(&[1], &[(1, 50)], true));
+        let tail = cache.insert(entry(&[2, 3, 4, 5], &[(2, 10)], false));
+        assert_eq!(cache.victim_except(None), Some(prompt));
+        assert_eq!(cache.victim_for_capture(|_| false), Some(tail));
+        cache.touch(tail);
+        assert_eq!(cache.victim_for_capture(|_| false), Some(prompt));
+        assert_eq!(cache.victim_for_capture(|id| id == prompt), Some(tail));
+        cache.mark_recent(prompt).unwrap();
+        assert_eq!(cache.entries[&prompt].hits, 0);
+    }
+
+    #[test]
+    fn selects_cheapest_compatible_endpoint_and_preserves_raw_overlap() {
+        let mut c = Cache::new(100);
+        let a = c.insert(entry(&[1, 2], &[(1, 10)], true));
+        let b = c.insert(entry(&[1, 2, 3], &[(2, 10)], true));
+        let query = [1, 2, 3, 4];
+        assert_eq!(
+            c.match_prefix_by(&query, &Media::default(), |e| {
+                Some(if e.tokens.len() == 2 { 1. } else { 2. })
+            }),
+            Match {
+                checkpoint: Some(a),
+                matched_tokens: 3
+            }
+        );
+        assert_eq!(
+            c.match_prefix_by(&query, &Media::default(), |_| None),
+            Match {
+                checkpoint: None,
+                matched_tokens: 3
+            }
+        );
+        assert_eq!(c.find(&query, &Media::default()), Some(b));
+    }
+    #[test]
+    fn splits_branches_and_never_manufactures_an_intermediate_state() {
+        let mut c = Cache::new(1000);
+        let a = c.insert(entry(&[1, 2, 3, 4], &[(1, 10)], true));
+        assert_eq!(
+            c.match_prefix(&[1, 2, 3, 9], &Media::default()),
+            Match {
+                checkpoint: None,
+                matched_tokens: 3
+            }
+        );
+        let b = c.insert(entry(&[1, 2], &[(2, 10)], true));
+        let d = c.insert(entry(&[1, 2, 3, 9], &[(3, 10)], true));
+        assert_eq!(c.find(&[1, 2, 3, 4, 5], &Media::default()), Some(a));
+        assert_eq!(c.find(&[1, 2, 3, 8], &Media::default()), Some(b));
+        c.remove(b);
+        assert_eq!(c.find(&[1, 2, 3, 8], &Media::default()), None);
+        assert_eq!(c.find(&[1, 2, 3, 9], &Media::default()), Some(d));
+        c.remove(a);
+        c.remove(d);
+        assert_eq!(c.bytes, 0);
+        assert!(c.root.children.is_empty());
+    }
+    #[test]
+    fn image_changes_only_invalidate_the_affected_suffix() {
+        let mut c = Cache::new(1000);
+        let plain = c.insert(entry(&[1, 2], &[(1, 10)], true));
+        let mut a = entry(&[1, 2, 3, 4, 5], &[(2, 10)], true);
+        a.media = Media(vec![(2, [1; 32]), (4, [2; 32])]);
+        c.insert(a);
+        let changed = Media(vec![(2, [1; 32]), (4, [3; 32])]);
+        assert_eq!(
+            c.match_prefix(&[1, 2, 3, 4, 5, 6], &changed),
+            Match {
+                checkpoint: Some(plain),
+                matched_tokens: 4
+            }
+        );
+        assert_eq!(
+            c.match_prefix(&[1, 2, 3, 4, 5, 6], &Media(vec![(2, [9; 32])]))
+                .matched_tokens,
+            2
+        );
+    }
+    #[test]
+    fn byte_budget_counts_shared_blocks_and_has_no_eight_entry_cap() {
+        let mut c = Cache::new(1000);
+        for i in 1..=20 {
+            c.insert(entry(&vec![1; i], &[(1, 100), (i as u64 + 1, 10)], true));
+        }
+        assert_eq!(c.entries.len(), 20);
+        assert_eq!(c.bytes, 300);
+        for _ in 0..19 {
+            c.evict_one().unwrap();
+        }
+        assert_eq!(c.bytes, 110);
+        c.evict_one();
+        assert_eq!(c.bytes, 0);
+    }
+    #[test]
+    fn output_state_requires_an_extension_when_its_head_is_stale() {
+        let mut c = Cache::new(100);
+        let p = c.insert(entry(&[1, 2], &[(1, 10)], true));
+        let g = c.insert(entry(&[1, 2, 3], &[(2, 10)], false));
+        assert_eq!(c.find(&[1, 2, 3], &Media::default()), Some(p));
+        assert_eq!(c.find(&[1, 2, 3, 4], &Media::default()), Some(g));
+        let mut upgraded = entry(&[1, 2, 3], &[(3, 10)], true);
+        upgraded.media = Media::default();
+        c.insert(upgraded);
+        assert_ne!(c.find(&[1, 2, 3], &Media::default()), Some(p));
+    }
+    #[test]
+    fn radix_matches_a_linear_oracle_after_arbitrary_splits_and_evictions() {
+        let mut c = Cache::new(1_000_000);
+        let mut random = 20261002u64;
+        for step in 0..400 {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let len = 1 + ((random >> 32) as usize % 12);
+            let tokens: Vec<_> = (0..len)
+                .map(|i| ((random >> (i * 3 % 48)) % 5) as u32)
+                .collect();
+            let mut e = entry(&tokens, &[(step + 1, 10)], step % 3 != 0);
+            e.media = Media(vec![(2, [(step % 3) as u8; 32])]);
+            c.insert(e);
+            if step % 4 == 0 {
+                c.evict_one();
+            }
+            let query: Vec<_> = tokens.iter().copied().chain([7]).collect();
+            let media = Media(vec![(2, [(step % 2) as u8; 32])]);
+            let found = c.match_prefix(&query, &media);
+            let mut expected_match = 0;
+            let mut expected_checkpoint = 0;
+            for e in c.entries.values() {
+                let raw = e
+                    .tokens
+                    .iter()
+                    .zip(&query)
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                let common = e.media.common_tokens(&media, raw);
+                expected_match = expected_match.max(common);
+                if common == e.tokens.len() && (common < query.len() || e.logits_valid) {
+                    expected_checkpoint = expected_checkpoint.max(common);
+                }
+            }
+            assert_eq!(
+                found.matched_tokens, expected_match,
+                "step {step}, query {query:?}, media {media:?}"
+            );
+            assert_eq!(
+                found
+                    .checkpoint
+                    .map(|id| c.entries[&id].tokens.len())
+                    .unwrap_or(0),
+                expected_checkpoint
+            );
+        }
+    }
+}

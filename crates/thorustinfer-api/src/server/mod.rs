@@ -1,0 +1,668 @@
+pub(crate) mod audio;
+pub(crate) mod batch;
+mod chat;
+mod continuous;
+mod deadline;
+pub(crate) mod defaults;
+mod grammar;
+mod image;
+pub(crate) use image::{decode_rgb, load_source};
+pub(crate) mod lifecycle;
+pub(crate) mod listener;
+mod metrics;
+mod output;
+mod preparation;
+#[cfg(test)]
+mod render_test;
+pub(crate) mod startup;
+mod thinking;
+mod token_boundary;
+
+use axum::{
+    Json, Router,
+    extract::{DefaultBodyLimit, State, rejection::JsonRejection},
+    http::{HeaderMap, StatusCode},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
+    routing::{get, post},
+};
+use chat::{ChatCodec, ChatRequest, Prepared};
+use futures_util::StreamExt;
+pub(crate) use lifecycle::shutdown_signal;
+use serde_json::{Value, json};
+use std::{
+    convert::Infallible,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
+use thorustinfer_engine::model::Model;
+use tokio::sync::{mpsc, oneshot};
+
+type Result<T> = std::result::Result<T, String>;
+use crate::{PreprocessingLimits as Limits, ServerConfig as Settings};
+use thorustinfer_engine::execution::LoadOptions;
+#[derive(Clone)]
+struct Service {
+    jobs: mpsc::Sender<Job>,
+    slots: Arc<tokio::sync::Semaphore>,
+    codec: Arc<ChatCodec>,
+    model: Arc<str>,
+    context: usize,
+    mtp_drafts: usize,
+    prompt_lookup: bool,
+    verify_weights: bool,
+    resident_experts: thorustinfer_engine::execution::ResidentExperts,
+    vision: Option<thorustinfer_engine::vision::VisionSpec>,
+    api_key: Option<Arc<str>>,
+    ids: Arc<AtomicU64>,
+    scheduler: thorustinfer_engine::scheduler::Options,
+    preparation: Arc<preparation::Pool>,
+    limits: Limits,
+    default_request_params: Arc<serde_json::Map<String, Value>>,
+    activity: Arc<continuous::Activity>,
+}
+struct Job {
+    _slot: Arc<tokio::sync::OwnedSemaphorePermit>,
+    _memory: Option<Arc<preparation::Lease>>,
+    limits: Limits,
+    prepared: Prepared,
+    events: mpsc::Sender<ModelEvent>,
+    id: String,
+    created: u64,
+    queued: Instant,
+    hint: Option<thorustinfer_engine::scheduler::RequestHint>,
+    /// Offline lookahead: Some retains only known shared prompt branches.
+    shared_prefix: Option<usize>,
+}
+enum ModelEvent {
+    Chunk(Value),
+    Complete(Value),
+    Failed(String),
+    Unavailable(String),
+    Deadline(deadline::Deadline),
+}
+
+fn stream_payload(event: Option<ModelEvent>) -> (String, bool) {
+    match event {
+        Some(ModelEvent::Chunk(value)) => (value.to_string(), false),
+        Some(ModelEvent::Complete(_)) => ("[DONE]".into(), true),
+        Some(ModelEvent::Failed(message)) => (json!({"error":{"message":message,"type":"server_error","code":"generation_error"}}).to_string(), true),
+        Some(ModelEvent::Unavailable(message)) => (json!({"error":{"message":message,"type":"server_error","code":"service_unavailable"}}).to_string(), true),
+        Some(ModelEvent::Deadline(deadline)) => (deadline.payload().to_string(), true),
+        None => (json!({"error":{"message":"GPU worker disconnected before completion","type":"server_error","code":"worker_disconnected"}}).to_string(), true),
+    }
+}
+
+pub fn run(settings: Settings) -> Result<()> {
+    settings.validate()?;
+    let descriptor: Value = serde_json::from_slice(
+        &std::fs::read(settings.model_dir.join("cache/model.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    if !descriptor["metadata"]["embedding"].is_null() {
+        return crate::embeddings::serve(settings);
+    }
+    if !descriptor["metadata"]["reranking"].is_null() {
+        return crate::reranking::serve(settings);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let result = runtime.block_on(serve(settings));
+    // Dropping a runtime normally waits forever for cancelled blocking tasks.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    result
+}
+fn router(state: Service) -> Router {
+    let limits = state.limits;
+    Router::new()
+        .route("/health", get(health))
+        .route("/metrics", get(metrics::endpoint))
+        .route("/v1/models", get(models))
+        .route(
+            "/v1/chat/completions/render",
+            post(render).layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                preparation::render_ingress,
+            )),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(completions).layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                preparation::ingress,
+            )),
+        )
+        .route(
+            "/v1/audio/transcriptions",
+            post(audio::transcriptions).layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                preparation::ingress,
+            )),
+        )
+        .fallback(|| async { error(StatusCode::NOT_FOUND, "Unknown API endpoint") })
+        .method_not_allowed_fallback(|| async {
+            error(StatusCode::METHOD_NOT_ALLOWED, "Unsupported HTTP method")
+        })
+        .layer(DefaultBodyLimit::max(limits.request_body_mib * 1024 * 1024))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            request_id,
+        ))
+        .with_state(state)
+}
+async fn serve(settings: Settings) -> Result<()> {
+    let started = Instant::now();
+    let (listener, _socket_path) = listener::bind(&settings.listen)
+        .await
+        .map_err(|error| format!("Listener bind failed: {error}"))?;
+    let worker = startup::start(&settings).await?;
+    let state = worker.state.clone();
+    let shutdown = Arc::clone(&worker.shutdown);
+    let lifecycle = Arc::clone(&state.activity.lifecycle);
+    let context = state.context;
+    let scheduler = state.scheduler;
+    let limits = state.limits;
+    let router = router(state);
+    eprintln!(
+        "API READY http://{}/v1; context {context}; continuous_batching=true, max_active={}, queue 128; startup={:.3}s",
+        settings.listen,
+        scheduler.max_active,
+        started.elapsed().as_secs_f64()
+    );
+    let shutdown_at = Arc::new(std::sync::Mutex::new(None));
+    let signal_shutdown_at = Arc::clone(&shutdown_at);
+    let signal_shutdown = Arc::clone(&shutdown);
+    let draining = Arc::new(tokio::sync::Notify::new());
+    let signal_draining = Arc::clone(&draining);
+    let signal_lifecycle = Arc::clone(&lifecycle);
+    let result = {
+        let shutdown = async move {
+            shutdown_signal().await;
+            if let Ok(mut started) = signal_shutdown_at.lock() {
+                *started = Some(Instant::now());
+            }
+            signal_lifecycle.drain();
+            signal_shutdown.store(true, Ordering::Relaxed);
+            signal_draining.notify_one();
+        };
+        let server = listener.serve(router, shutdown);
+        tokio::pin!(server);
+        tokio::select! {
+            result = &mut server => result.map_err(|e| e.to_string()),
+            _ = draining.notified() => {
+                match tokio::time::timeout(std::time::Duration::from_millis(limits.drain_ms), &mut server).await {
+                    Ok(result) => result.map_err(|e| e.to_string()),
+                    Err(_) => Err("HTTP drain deadline exceeded".into()),
+                }
+            }
+        }
+    };
+    shutdown.store(true, Ordering::Relaxed);
+    let remaining_ms = shutdown_at
+        .lock()
+        .ok()
+        .and_then(|v| *v)
+        .map(|at| {
+            limits
+                .drain_ms
+                .saturating_sub(at.elapsed().as_millis().min(u64::MAX as u128) as u64)
+        })
+        .unwrap_or(limits.drain_ms);
+    worker.stop(remaining_ms).await?;
+    result
+}
+pub(crate) fn api_key() -> Option<Arc<str>> {
+    std::env::var("THORUSTINFER_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+        .map(Into::into)
+}
+pub(crate) fn bearer_authorized(key: Option<&str>, headers: &HeaderMap) -> bool {
+    key.is_none_or(|key| {
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            == Some(key)
+    })
+}
+fn authorized(state: &Service, headers: &HeaderMap) -> bool {
+    bearer_authorized(state.api_key.as_deref(), headers)
+}
+async fn request_id(
+    State(state): State<Service>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let serial = state.ids.fetch_add(1, Ordering::Relaxed);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let id = format!("req-{now:x}-{:x}-{serial:x}", std::process::id());
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert("x-request-id", id.parse().unwrap());
+    response
+}
+pub(crate) fn error(status: StatusCode, message: impl Into<String>) -> Response {
+    let kind = match status {
+        StatusCode::UNAUTHORIZED => "authentication_error",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        StatusCode::INTERNAL_SERVER_ERROR | StatusCode::SERVICE_UNAVAILABLE => "server_error",
+        _ => "invalid_request_error",
+    };
+    let message = message.into();
+    let candidate = message.split("target type: ").nth(1).unwrap_or(&message);
+    let param = candidate
+        .split_once(": ")
+        .map(|(p, _)| p)
+        .filter(|p| {
+            !p.is_empty()
+                && p.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_.[]".contains(c))
+        })
+        .or_else(|| {
+            ["unknown field `", "missing field `"]
+                .iter()
+                .find_map(|prefix| candidate.split_once(prefix)?.1.split_once('`').map(|p| p.0))
+        });
+    let code = match status {
+        StatusCode::BAD_REQUEST if message.contains("exceeds the context window") => {
+            "context_length_exceeded"
+        }
+        StatusCode::BAD_REQUEST => "invalid_request",
+        StatusCode::UNAUTHORIZED => "invalid_api_key",
+        StatusCode::TOO_MANY_REQUESTS => "queue_full",
+        StatusCode::SERVICE_UNAVAILABLE => "service_unavailable",
+        StatusCode::NOT_FOUND => "not_found",
+        StatusCode::METHOD_NOT_ALLOWED => "method_not_allowed",
+        _ => "server_error",
+    };
+    let mut response = (
+        status,
+        Json(json!({"error":{"message":message,"type":kind,"param":param,"code":code}})),
+    )
+        .into_response();
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, "1".parse().unwrap());
+    }
+    response
+}
+async fn health(State(state): State<Service>) -> Response {
+    let output_limit = match defaults::validation_request(&state.default_request_params) {
+        Ok(request) => state.codec.max_tokens(&request),
+        Err(message) => return error(StatusCode::INTERNAL_SERVER_ERROR, message),
+    };
+    (if state.activity.lifecycle.is_ready() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE }, Json(
+        json!({"service":"thorustinfer","version":env!("CARGO_PKG_VERSION"),"status":state.activity.lifecycle.name(),"failure":state.activity.lifecycle.failure(),"model":state.model.as_ref(),"max_context":state.context,
+        "frontend_assets":state.codec.asset_hashes,
+        "verify_weights":state.verify_weights,
+        "resident_experts":state.resident_experts,
+        "default_request_params":state.default_request_params.as_ref(),
+        "image_preprocess_cache":state.preparation.images.statistics(),
+        "preparation_statistics":state.preparation.statistics(),
+        "tokenization_cache":state.codec.boundary.as_ref().map(|b| b.cache_statistics()),
+        "image_limits":{"history_tokens":state.vision.as_ref().map(|v|v.max_features),"tokens_per_image":state.vision.as_ref().and_then(|v|v.max_image_tokens),"request_body_mib":state.limits.request_body_mib},
+        "chat_capabilities":{"streaming":true,"default_stream":state.default_request_params.get("stream").and_then(Value::as_bool).unwrap_or(false),"max_choices":1,
+            "response_formats":["text","json_object","json_schema"],"constraint_backend":"llguidance",
+            "tools":{"function":state.codec.tools_supported,"strict":state.codec.tools_supported,"required":state.codec.tools_supported,"incremental_arguments":state.codec.tools_supported},
+            "logprobs":true,"max_top_logprobs":20,"logit_bias":true,"stored_completions":false,
+            "images":state.vision.is_some(),"video":false,"audio":state.codec.audio.is_some(),"default_max_completion_tokens":output_limit,
+            "thinking_token_budget":true,"chat_template_kwargs":true,"prompt_cache":{"key":true,"retention":["in-memory","24h"],"persistent":false,"ttl_guaranteed":false}},
+        "mtp":{"enabled":state.mtp_drafts>0,"max_drafts":state.mtp_drafts},
+        "prompt_lookup":{"enabled":state.prompt_lookup && state.mtp_drafts>0},
+        "continuous_batching":true,"scheduler":state.scheduler,
+        "scheduler_statistics":state.activity.statistics.lock().ok().map(|s| s.clone()),
+        "admission_statistics":state.activity.admission.lock().ok().map(|s| s.clone()),
+        "output_pipeline_statistics":state.activity.output_pipeline.lock().ok().map(|s| s.clone()),
+        "active_requests":state.activity.active.load(Ordering::Relaxed),
+        "queued_requests":state.activity.queued.load(Ordering::Relaxed)}),
+    )).into_response()
+}
+async fn models(State(state): State<Service>, headers: HeaderMap) -> Response {
+    if !authorized(&state, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "Invalid API key");
+    }
+    Json(json!({"object":"list","data":[{"id":state.model.as_ref(),"object":"model","created":0,"owned_by":"thorustinfer"}]})).into_response()
+}
+async fn completions(
+    State(state): State<Service>,
+    axum::Extension(admission): axum::Extension<preparation::Ingress>,
+    body: std::result::Result<Json<Value>, JsonRejection>,
+) -> Response {
+    prepare_chat(state, admission, body, false).await
+}
+async fn render(
+    State(state): State<Service>,
+    axum::Extension(admission): axum::Extension<preparation::Ingress>,
+    body: std::result::Result<Json<Value>, JsonRejection>,
+) -> Response {
+    prepare_chat(state, admission, body, true).await
+}
+async fn prepare_chat(
+    state: Service,
+    admission: preparation::Ingress,
+    body: std::result::Result<Json<Value>, JsonRejection>,
+    render: bool,
+) -> Response {
+    let request = match body {
+        Ok(Json(mut v)) => {
+            if render {
+                match v.as_object_mut().and_then(|o| o.remove("return_mm_kwargs")) {
+                    None | Some(Value::Null | Value::Bool(false)) => {}
+                    _ => {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "return_mm_kwargs: Only false is supported; render returns token IDs without tensors",
+                        );
+                    }
+                }
+            }
+            match defaults::decode(v, &state.default_request_params) {
+                Ok(request) => request,
+                Err(e) => return error(StatusCode::BAD_REQUEST, e),
+            }
+        }
+        Err(e) => {
+            return error(
+                if e.status() == StatusCode::UNPROCESSABLE_ENTITY {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    e.status()
+                },
+                e.body_text(),
+            );
+        }
+    };
+    let preparation::Ingress { slot, body } = admission;
+    let estimate = preparation::request_memory(
+        &request,
+        state.context,
+        state.vision.as_ref(),
+        state.limits.memory_mib,
+        state.codec.max_tokens(&request),
+    );
+    let memory_mib = estimate.mib;
+    if memory_mib as usize > state.limits.memory_mib {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "Request exceeds preprocessing memory budget",
+        );
+    }
+    let mut timing = preparation::Timing::default();
+    let waiting = Instant::now();
+    let mut memory = match Arc::clone(&state.preparation.memory)
+        .acquire_many_owned(memory_mib)
+        .await
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Preprocessing memory unavailable",
+            );
+        }
+    };
+    timing.memory_wait_s = waiting.elapsed().as_secs_f64();
+    let waiting = Instant::now();
+    let cpu = match Arc::clone(&state.preparation.workers).acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "Preprocessing unavailable"),
+    };
+    timing.worker_wait_s = waiting.elapsed().as_secs_f64();
+    let codec = Arc::clone(&state.codec);
+    let model = Arc::clone(&state.model);
+    let context = state.context;
+    let vision = state.vision.clone();
+    let image_cache = Arc::clone(&state.preparation.images);
+    let cancellation = preparation::Cancellation::default();
+    let flag = cancellation.flag();
+    let pool = Arc::clone(&state.preparation);
+    let prepared = match tokio::task::spawn_blocking(move || {
+        // Admission and memory belong to actual work, including after handler cancellation.
+        let _cpu = cpu;
+        let _body = body;
+        let mut preparation = estimate.context(flag);
+        preparation.images = Some(image_cache);
+        preparation.timing = timing;
+        let started = Instant::now();
+        let result = (|| -> Result<_> {
+            preparation.checkpoint(0)?;
+            let prepared =
+                codec.prepare(request, &model, context, vision.as_ref(), &mut preparation)?;
+            preparation.checkpoint(0)?;
+            if !prepared.audios.is_empty() || !prepared.images.is_empty() {
+                preparation.release_media_scratch(&mut memory);
+            }
+            Ok(prepared)
+        })();
+        preparation.timing.prepare_s = started.elapsed().as_secs_f64();
+        pool.observe(&preparation.timing, result.is_err());
+        result.map(|prepared| {
+            (
+                prepared,
+                slot,
+                preparation.lease(memory),
+                preparation.timing,
+            )
+        })
+    })
+    .await
+    {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(e)) => return error(StatusCode::BAD_REQUEST, e),
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let (prepared, slot, memory, timing) = prepared;
+    let memory = Arc::new(memory);
+    if !state.activity.lifecycle.is_ready() {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "GPU worker is not ready");
+    }
+    if render {
+        return retain_output_memory(Json(json!({"model":state.model.as_ref(),"token_ids":prepared.input,"token_count":prepared.input.len(),"multimodal":!prepared.images.is_empty() || !prepared.audios.is_empty()})).into_response(), memory);
+    }
+    let Some(slot) = slot else {
+        return error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Generation admission is missing",
+        );
+    };
+    let stream = prepared.stream;
+    let (events, mut responses) = mpsc::channel(64);
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let serial = state.ids.fetch_add(1, Ordering::Relaxed);
+    let job = Job {
+        _slot: slot,
+        _memory: Some(Arc::clone(&memory)),
+        limits: state.limits,
+        prepared,
+        events,
+        id: format!("chatcmpl-{created}-{}-{serial}", std::process::id()),
+        created,
+        queued: Instant::now(),
+        hint: None,
+        shared_prefix: None,
+    };
+    eprintln!(
+        "{}: preparation {}",
+        job.id,
+        serde_json::to_string(&timing).unwrap()
+    );
+    if let Err(e) = state.jobs.try_send(job) {
+        return match e {
+            mpsc::error::TrySendError::Full(_) => {
+                error(StatusCode::TOO_MANY_REQUESTS, "Request queue is full")
+            }
+            _ => error(StatusCode::SERVICE_UNAVAILABLE, "GPU worker unavailable"),
+        };
+    }
+    if stream {
+        let events =
+            futures_util::stream::unfold((responses, false), |(mut receiver, done)| async move {
+                if done {
+                    return None;
+                }
+                let (payload, terminal) = stream_payload(receiver.recv().await);
+                Some((
+                    Ok::<_, Infallible>(Event::default().data(payload)),
+                    (receiver, terminal),
+                ))
+            });
+        retain_output_memory(
+            Sse::new(events)
+                .keep_alive(KeepAlive::default())
+                .into_response(),
+            memory,
+        )
+    } else {
+        while let Some(event) = responses.recv().await {
+            match event {
+                ModelEvent::Complete(response) => {
+                    return retain_output_memory(Json(response).into_response(), memory);
+                }
+                ModelEvent::Failed(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
+                ModelEvent::Unavailable(e) => return error(StatusCode::SERVICE_UNAVAILABLE, e),
+                ModelEvent::Deadline(deadline) => return deadline.response(),
+                ModelEvent::Chunk(_) => {}
+            }
+        }
+        error(StatusCode::SERVICE_UNAVAILABLE, "GPU worker disconnected")
+    }
+}
+fn retain_output_memory(response: Response, memory: Arc<preparation::Lease>) -> Response {
+    let (parts, body) = response.into_parts();
+    let stream = futures_util::stream::unfold(
+        (body.into_data_stream(), memory),
+        |(mut body, memory)| async move { body.next().await.map(|data| (data, (body, memory))) },
+    );
+    Response::from_parts(parts, axum::body::Body::from_stream(stream))
+}
+fn chunk(job: &Job, model: &str, delta: Value, finish: Option<&str>) -> Value {
+    let mut chunk = json!({"id":job.id,"object":"chat.completion.chunk","created":job.created,"model":model,"choices":[{"index":0,"delta":delta,"finish_reason":finish,"logprobs":null}]});
+    if job.prepared.include_usage {
+        chunk["usage"] = Value::Null;
+    }
+    chunk
+}
+async fn wait_worker(worker: &std::thread::JoinHandle<()>, timeout_ms: u64) -> bool {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    while !worker.is_finished() {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    true
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    #[tokio::test]
+    async fn deadlines_have_the_same_typed_outcome_in_http_and_sse() {
+        for deadline in [deadline::Deadline::Queue, deadline::Deadline::Output] {
+            let (payload, terminal) = stream_payload(Some(ModelEvent::Deadline(deadline)));
+            assert!(terminal);
+            let payload: Value = serde_json::from_str(&payload).unwrap();
+            let response = deadline.response();
+            assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+            let retryable = matches!(deadline, deadline::Deadline::Queue);
+            assert_eq!(response.headers().contains_key("retry-after"), retryable);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&body).unwrap(), payload);
+            assert_eq!(payload["error"]["retryable"], retryable);
+            assert_ne!(payload["error"]["code"], "generation_error");
+        }
+        let response = error(StatusCode::TOO_MANY_REQUESTS, "Request queue is full");
+        assert_eq!(response.headers()["retry-after"], "1");
+    }
+    #[tokio::test]
+    async fn context_overflow_has_a_client_recognizable_code_and_parameter() {
+        let response = error(
+            StatusCode::BAD_REQUEST,
+            "max_completion_tokens: Request exceeds the context window of 100 tokens: 90 prompt tokens + 20 output tokens",
+        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "context_length_exceeded");
+        assert_eq!(body["error"]["param"], "max_completion_tokens");
+    }
+    #[tokio::test]
+    async fn output_memory_is_held_until_http_body_finishes_or_is_dropped() {
+        for consume in [false, true] {
+            let permits = Arc::new(tokio::sync::Semaphore::new(1));
+            let context = preparation::Context::new(Arc::new(AtomicBool::new(false)), 1 << 20);
+            let memory = Arc::new(context.lease(Arc::clone(&permits).try_acquire_owned().unwrap()));
+            let response = retain_output_memory(Json(json!({"ok":true})).into_response(), memory);
+            assert_eq!(permits.available_permits(), 0);
+            if consume {
+                axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap();
+            } else {
+                drop(response);
+            }
+            assert_eq!(permits.available_permits(), 1);
+        }
+    }
+    #[tokio::test]
+    async fn stuck_worker_cannot_block_shutdown_indefinitely() {
+        let (release, gate) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            gate.recv().unwrap();
+        });
+        assert!(!wait_worker(&worker, 5).await);
+        release.send(()).unwrap();
+        assert!(wait_worker(&worker, 1000).await);
+        worker.join().unwrap();
+    }
+    #[tokio::test]
+    async fn capacity_rejection_is_a_service_error_in_http_and_sse() {
+        use axum::body::to_bytes;
+        let (payload, terminal) = stream_payload(Some(ModelEvent::Unavailable("capacity".into())));
+        assert!(terminal);
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload).unwrap()["error"]["code"],
+            "service_unavailable"
+        );
+        let response = error(StatusCode::SERVICE_UNAVAILABLE, "capacity");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["error"]["code"],
+            "service_unavailable"
+        );
+    }
+    #[test]
+    fn abnormal_worker_eof_cannot_look_like_successful_partial_output() {
+        let (payload, terminal) = stream_payload(None);
+        assert!(terminal);
+        assert!(serde_json::from_str::<Value>(&payload).unwrap()["error"].is_object());
+        assert_ne!(payload, "[DONE]");
+        assert!(stream_payload(Some(ModelEvent::Failed("fault".into()))).1);
+        assert_eq!(
+            stream_payload(Some(ModelEvent::Complete(json!({})))).0,
+            "[DONE]"
+        );
+    }
+}

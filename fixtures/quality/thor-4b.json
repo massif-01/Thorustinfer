@@ -1,0 +1,22 @@
+[
+ ["add","What is 38 + 47? Reply with just the integer.",["85"]],
+ ["multiply","What is 13 times 8? Reply with just the integer.",["104"]],
+ ["time","An event starts at 23:50 and lasts 25 minutes. Give the end time as HH:MM only.",["00:15"]],
+ ["fraction","Express three quarters as a decimal. Give only the decimal.",["0.75"]],
+ ["max","Which is largest: 71, 17, 107, or 70? Return only the integer.",["107"]],
+ ["order","Sort 9, 2, 5 from smallest to largest. Separate the integers with commas.",["2,5,9"]],
+ ["lookup","Order A is RED-42. Order B is BLUE-17. Order C is RED-24. Return only the code for order C.",["RED-24"]],
+ ["date","In the sentence 'The shipment arrived on 2024-02-29 in Osaka', extract the date only.",["2024-02-29"]],
+ ["boolean","A=TRUE and B=FALSE. What is A AND B? Reply TRUE or FALSE only.",["FALSE"]],
+ ["syllable","Write the final letter of the English word 'planet'. Reply with one letter.",["t"]],
+ ["count","How many times does the letter a appear in banana? Reply with one digit.",["3"]],
+ ["json","Read this JSON: {\"p\":9,\"q\":2}. Return only the value of q.",["2"]],
+ ["celsius","At sea level, pure water freezes at how many degrees Celsius? Output only the number.",["0"]],
+ ["country","Tokyo is the capital of which country? Reply with the English country name only.",["Japan"]],
+ ["translation","把 apple 译为简体中文，只输出水果名。",["苹果"]],
+ ["zh_lookup","表中甲组代号为青松，乙组为白桦，丙组为青竹。只输出乙组代号。",["白桦"]],
+ ["zh_arith","仓库有24箱，发出7箱，又收到3箱。只回答最后的箱数，使用阿拉伯数字。",["20"]],
+ ["unit","How many centimeters are in two and a half meters? Reply with just the integer.",["250"]],
+ ["logic","All ravens are birds. Is every raven a bird? Answer YES or NO only.",["YES"]],
+ ["reverse","Reverse the three letters in DOG. Output only the three uppercase letters.",["GOD"]]
+]

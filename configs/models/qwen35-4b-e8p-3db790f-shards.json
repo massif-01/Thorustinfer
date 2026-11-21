@@ -1,0 +1,6 @@
+{
+  "model.safetensors-00001-of-00002.safetensors": "3cc6e353ec45c7ba9511debf9670880dcd98efb140326a688e7f03230a2334c0",
+  "model.safetensors-00002-of-00002.safetensors": "e19d4d2c67a83a07723e670aa9747123b729b8dd8f18dbc63733d6c0cac28180",
+  "quantization.safetensors": "4b7836de7f056e00ab55dc9ad12968dde9da0497d1112dd96b0842dfdb64c12a",
+  "runtime.safetensors": "328b6ef4f941ddca77207f550f01436a47486629fc37d5a1a35f31030041b4d3"
+}

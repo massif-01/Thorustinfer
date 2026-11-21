@@ -1,0 +1,15 @@
+[package]
+name = "thorustinfer-model-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thorustinfer-device.workspace = true
+serde = { workspace = true, features = ["rc"] }
+serde_json.workspace = true

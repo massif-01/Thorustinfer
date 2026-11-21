@@ -1,0 +1,145 @@
+//! Install CUDA and Ascend execution archives on CPU.
+use super::ExecutionPackage;
+use crate::artifact::{Result, sha256};
+use serde::Serialize;
+use std::{
+    collections::BTreeSet,
+    fs::{self, File},
+    io::{self, BufRead, BufReader, Read},
+    os::{fd::AsRawFd, unix::fs::PermissionsExt},
+    path::{Component, Path, PathBuf},
+};
+
+#[derive(Debug, Serialize)]
+pub struct InstalledPackage {
+    pub digest: String,
+    pub path: PathBuf,
+}
+
+/// Validate in a private directory on the cache filesystem, then publish once.
+/// Existing packages are never replaced, including concurrent installations.
+pub fn install(archive: &Path, cache: &Path) -> Result<InstalledPackage> {
+    install_inner(archive, cache).map_err(|e| format!("Package installation: {e}"))
+}
+
+fn install_inner(archive: &Path, cache: &Path) -> Result<InstalledPackage> {
+    let mut input = BufReader::new(File::open(archive).map_err(|e| e.to_string())?);
+    let magic = input.fill_buf().map_err(|e| e.to_string())?;
+    let decoder: Box<dyn Read> = if magic.starts_with(b"\xfd7zXZ\0") {
+        Box::new(lzma_rust2::XzReader::new_mem_limit(input, true, 256 * 1024))
+    } else if magic.starts_with(b"\x1f\x8b") {
+        Box::new(flate2::read::MultiGzDecoder::new(input))
+    } else {
+        return Err("Expected a .tar.xz or .tar.gz execution package".into());
+    };
+    fs::create_dir_all(cache).map_err(|e| e.to_string())?;
+    let staging = tempfile::Builder::new()
+        .prefix(".install-")
+        .tempdir_in(cache)
+        .map_err(|e| e.to_string())?;
+    let mut archive = tar::Archive::new(decoder);
+    let mut root = None;
+    let mut seen = BTreeSet::new();
+    for entry in archive.entries().map_err(|e| e.to_string())? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path().map_err(|e| e.to_string())?.into_owned();
+        let mut parts = path.components();
+        let Some(Component::Normal(name)) = parts.next() else {
+            return Err("Unsafe archive path".into());
+        };
+        let digest = name.to_str().ok_or("Malformed package digest")?;
+        if !crate::artifact::is_sha256_hex(digest) {
+            return Err("Malformed package digest".into());
+        }
+        if root.as_deref().is_some_and(|previous| previous != digest) {
+            return Err("Expected one package directory".into());
+        }
+        if parts.any(|p| !matches!(p, Component::Normal(_))) {
+            return Err("Unsafe archive path".into());
+        }
+        root = Some(digest.to_owned());
+        let kind = entry.header().entry_type();
+        if !(kind.is_file() || kind.is_dir()) || !seen.insert(path.clone()) {
+            return Err("Expected unique regular files and directories".into());
+        }
+        if !entry.unpack_in(staging.path()).map_err(|e| e.to_string())? {
+            return Err("Unsafe archive path".into());
+        }
+        // Ignore archive permissions so even mode-000 directories remain removable.
+        fs::set_permissions(
+            staging.path().join(path),
+            fs::Permissions::from_mode(if kind.is_dir() { 0o755 } else { 0o644 }),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    // Tar ends before the compression footer. Read through it to verify integrity.
+    io::copy(&mut archive.into_inner(), &mut io::sink()).map_err(|e| e.to_string())?;
+    let digest = root.ok_or("Empty package archive")?;
+    let source = staging
+        .path()
+        .join(&digest)
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    validate(&source, &digest)?;
+    let destination = cache.join(&digest);
+    rename_new(&source, &destination)?;
+    Ok(InstalledPackage {
+        digest,
+        path: destination.canonicalize().map_err(|e| e.to_string())?,
+    })
+}
+
+fn validate(root: &Path, digest: &str) -> Result<()> {
+    let raw = fs::read(root.join("package.json")).map_err(|e| e.to_string())?;
+    if sha256(&raw) != digest {
+        return Err("Execution package digest mismatch".into());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+    if value["backend"] == "ascend" {
+        let package: crate::models::deepseek_v41::provider::Package =
+            serde_json::from_value(value).map_err(|e| e.to_string())?;
+        super::generated::materialize(root, &package.generated_assets)?;
+        return crate::models::deepseek_v41::validation::validate_package(root, &package);
+    }
+    let package: ExecutionPackage = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+    package.validate_metadata()?;
+    let bindings = package.read_bindings(root, true)?;
+    let mut checked = BTreeSet::new();
+    for template in bindings.dynamic.values() {
+        if checked.insert((template.capacity, &template.grid, &template.arguments)) {
+            template.validate_rows()?;
+        }
+    }
+    Ok(())
+}
+
+fn rename_new(source: &Path, destination: &Path) -> Result<()> {
+    let directory = File::open(
+        destination
+            .parent()
+            .ok_or("Package cache has no directory")?,
+    )
+    .map_err(|e| e.to_string())?;
+    loop {
+        // SAFETY: the live directory descriptor is retained until publication ends.
+        // An advisory cache lock serializes installers on ext4 and ZFS without
+        // requiring renameat2(RENAME_NOREPLACE) or leaving a lock-file artifact.
+        if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error.to_string());
+        }
+    }
+    match fs::symlink_metadata(destination) {
+        Ok(_) => Err("Execution package already installed; existing files were not changed".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::rename(source, destination).map_err(|e| e.to_string())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests;

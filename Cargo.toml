@@ -1,0 +1,33 @@
+[workspace]
+members = ["crates/thorustinfer-device", "crates/thorustinfer-engine", "crates/thorustinfer-cli", "crates/thorustinfer-api", "crates/thorustinfer-model-sdk", "crates/thorustinfer-models"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+publish = false
+license = "LGPL-3.0-or-later"
+
+[workspace.dependencies]
+thorustinfer-api = { path = "crates/thorustinfer-api" }
+thorustinfer-engine = { path = "crates/thorustinfer-engine" }
+thorustinfer-model-sdk = { path = "crates/thorustinfer-model-sdk" }
+thorustinfer-models = { path = "crates/thorustinfer-models" }
+thorustinfer-device = { path = "crates/thorustinfer-device" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+half = "=2.7.1"
+sha2 = "=0.11.1"
+hex = "=0.4.3"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+dead_code = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

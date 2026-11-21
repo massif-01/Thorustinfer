@@ -1,0 +1,34 @@
+//! Model semantics and execution composition, independent of precision selection.
+use thorustinfer_model_sdk::{architecture::BatchSegment, artifact::Result, packet};
+
+pub trait Adapter {
+    fn prepare(
+        &self,
+        _program: &str,
+        _tokens: &[u32],
+        _history: &[u32],
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        Ok(vec![])
+    }
+    fn prefetch_inputs(&self, _tokens: &[u32], _history: &[u32]) {}
+    fn batch(&self, segments: &[BatchSegment], include_plan: bool) -> Result<packet::BatchPlan>;
+    fn batch_operation(
+        &self,
+        segments: &[BatchSegment],
+        operation: packet::BatchOperation,
+        include_plan: bool,
+    ) -> Result<packet::BatchPlan> {
+        if operation != packet::BatchOperation::Ordinary {
+            return Err("Model adapter does not provide this batch operation".into());
+        }
+        self.batch(segments, include_plan)
+    }
+    fn visual(
+        &self,
+        _tokens: &[u32],
+        _images: &[thorustinfer_model_sdk::architecture::ImageGrid],
+        _capacity: usize,
+    ) -> Result<(Vec<i32>, Vec<u32>)> {
+        Err("Model package has no visual layout adapter".into())
+    }
+}

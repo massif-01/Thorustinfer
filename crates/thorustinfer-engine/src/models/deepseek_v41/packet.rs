@@ -1,0 +1,1032 @@
+use super::{Execution, Step, Worker, get, upload};
+use crate::{
+    artifact::Result,
+    backend::ascend::runtime::{Buffer, Ticket},
+};
+use safetensors::Dtype;
+use serde::Deserialize;
+use std::{fs, path::Path, rc::Rc, time::Instant};
+
+pub(super) struct Inputs<'a> {
+    pub tokens: &'a [u32],
+    pub hashes: &'a [i64],
+    pub valid: &'a [bool],
+    pub visual_rows: &'a [super::vision::Overlay],
+    pub device: Option<super::device_inputs::Prepared>,
+    pub first: Option<&'a super::host_inputs::First>,
+    pub next: Option<&'a super::host_inputs::Window>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Coordinates {
+    #[serde(default)]
+    pub draft_block: Option<usize>,
+    /// Physical history ring; its logical attention window remains 128 rows.
+    #[serde(default)]
+    pub draft_swa_storage_rows: Option<usize>,
+    #[serde(default)]
+    pub input_ids: Option<String>,
+    #[serde(default)]
+    pub image_rows: Option<String>,
+    #[serde(default)]
+    pub device_indices: bool,
+    pub base_cos: String,
+    pub base_sin: String,
+    pub long_cos: String,
+    pub long_sin: String,
+    pub source_cos: String,
+    pub source_sin: String,
+    pub slots: String,
+    pub c2_slots: String,
+    pub swa_indices: String,
+    /// Selected queries of the last producer retain its full SWA history.
+    #[serde(default)]
+    pub source_swa_indices: Option<String>,
+    pub c1_indices: String,
+    pub c2_indices: String,
+    pub c1_lengths: String,
+    pub c2_lengths: String,
+    pub ring: String,
+    pub premix: String,
+}
+impl Coordinates {
+    pub(super) fn draft_storage_rows(&self) -> Result<usize> {
+        let rows = self.draft_swa_storage_rows.unwrap_or(128);
+        if !(128..=4096).contains(&rows)
+            || !rows.is_power_of_two()
+            || self.draft_swa_storage_rows.is_some() && self.draft_block.is_none()
+        {
+            return Err("Invalid draft history ring geometry".into());
+        }
+        Ok(rows)
+    }
+    pub(super) fn names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = vec![
+            &self.base_cos,
+            &self.base_sin,
+            &self.long_cos,
+            &self.long_sin,
+            &self.source_cos,
+            &self.source_sin,
+            &self.slots,
+            &self.c2_slots,
+            &self.swa_indices,
+            &self.c1_indices,
+            &self.c2_indices,
+            &self.c1_lengths,
+            &self.c2_lengths,
+            &self.ring,
+            &self.premix,
+        ];
+        names.extend(self.source_swa_indices.as_deref());
+        names.extend(self.input_ids.as_deref());
+        names.extend(self.image_rows.as_deref());
+        names
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Best {
+    pub value: f32,
+    pub token: u32,
+}
+
+/// Per-row-count execution accounting for one request segment. All seconds
+/// are wall time on this rank's worker thread; counts are per forward.
+#[derive(Default)]
+pub(super) struct StepStats {
+    forwards: usize,
+    coordinate_s: f64,
+    hash_s: f64,
+    body_s: f64,
+    head_s: f64,
+    download_s: f64,
+    graph: (usize, f64),
+    reduce: (usize, f64),
+    w4: (usize, f64),
+    route: (usize, f64),
+    route_dl: (usize, f64),
+    route_cpu: (usize, f64),
+    route_up: (usize, f64),
+    route_grp: (usize, f64),
+    lookup: (usize, f64),
+    embed: (usize, f64),
+}
+
+fn ints(values: &[i32]) -> Vec<u8> {
+    values.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+pub(super) fn embedding_span(first: usize, columns: usize) -> Result<std::ops::Range<usize>> {
+    let end = first
+        .checked_add(columns)
+        .filter(|&end| columns != 0 && end <= 5120)
+        .ok_or("Embedding columns outside the original row")?;
+    Ok(first * 2..end * 2)
+}
+
+impl Worker {
+    fn coordinate(&self, names: &Coordinates, base: usize, rows: usize) -> Result<()> {
+        self.session
+            .upload_inputs(&self.coordinate_inputs(names, base, rows, 0, None)?)?;
+        Ok(())
+    }
+    pub(super) fn coordinate_inputs(
+        &self,
+        names: &Coordinates,
+        base: usize,
+        rows: usize,
+        offset: usize,
+        minimum: Option<usize>,
+    ) -> Result<Vec<(Buffer, Vec<u8>)>> {
+        if rows == 0 || base.checked_add(rows).is_none_or(|end| end > self.capacity) {
+            return Err("Packet exceeds model context capacity".into());
+        }
+        let mut inputs = vec![];
+        let put = |inputs: &mut Vec<(Buffer, Vec<u8>)>, name: &str, data: &[u8]| -> Result<()> {
+            if !data.len().is_multiple_of(rows) {
+                return Err("Coordinate row stride differs".into());
+            }
+            let byte_offset = offset
+                .checked_mul(data.len() / rows)
+                .ok_or("Coordinate offset overflow")?;
+            inputs.push((
+                get(&self.buffers, name)?.slice(byte_offset, data.len())?,
+                data.to_vec(),
+            ));
+            Ok(())
+        };
+        for (asset, target, compressed) in [
+            ("base_cos", &names.base_cos, false),
+            ("base_sin", &names.base_sin, false),
+            ("long_cos", &names.long_cos, false),
+            ("long_sin", &names.long_sin, false),
+            ("long_cos", &names.source_cos, true),
+            ("long_sin", &names.source_sin, true),
+        ] {
+            let table = self.rope.get(asset).ok_or("RoPE asset missing")?;
+            let mut data = Vec::with_capacity(rows * 128);
+            for position in base..base + rows {
+                let row = if compressed {
+                    position / 2 * 2
+                } else {
+                    position
+                };
+                data.extend_from_slice(
+                    table
+                        .get(row * 128..row * 128 + 128)
+                        .ok_or("RoPE position outside table")?,
+                );
+            }
+            put(&mut inputs, target, &data)?;
+        }
+        let slots = (base..base + rows).map(|p| p as i32).collect::<Vec<_>>();
+        let c2_slots = (base..base + rows)
+            .map(|p| {
+                if names.draft_block.is_some() {
+                    (p - base) as i32
+                } else if p % 2 == 1 {
+                    (p / 2) as i32
+                } else {
+                    -1
+                }
+            })
+            .collect::<Vec<_>>();
+        put(&mut inputs, &names.slots, &ints(&slots))?;
+        put(&mut inputs, &names.c2_slots, &ints(&c2_slots))?;
+        let mut swa = vec![-1; rows * 128];
+        let draft_storage = names.draft_storage_rows()?;
+        let mut metadata = vec![0; rows * 8];
+        let mut mix = vec![0f32; rows * 8];
+        for row in 0..rows {
+            let position = base + row;
+            for (lane, previous) in (if names.draft_block.is_some() {
+                base.saturating_sub(128)..base
+            } else {
+                position.saturating_sub(127).max(minimum.unwrap_or(0))..position + 1
+            })
+            .enumerate()
+            {
+                swa[row * 128 + lane] = if names.draft_block.is_some() {
+                    (previous % draft_storage) as i32
+                } else {
+                    previous as i32
+                };
+            }
+            metadata[row * 8..row * 8 + 6].copy_from_slice(&[
+                position as i32,
+                1,
+                if row == 0 { -1 } else { (row - 1) as i32 },
+                1,
+                (base + rows - 1) as i32,
+                1,
+            ]);
+            mix[row * 8] = 1.0;
+        }
+        put(&mut inputs, &names.swa_indices, &ints(&swa))?;
+        if let Some(source) = &names.source_swa_indices {
+            // Only the consumer layers rebuild SWA from the bounded window.
+            swa.fill(-1);
+            for row in 0..rows {
+                let position = base + row;
+                for (lane, previous) in (position.saturating_sub(127)..=position).enumerate() {
+                    swa[row * 128 + lane] = previous as i32;
+                }
+            }
+            put(&mut inputs, source, &ints(&swa))?;
+        }
+        put(&mut inputs, &names.ring, &ints(&metadata))?;
+        put(
+            &mut inputs,
+            &names.premix,
+            &mix.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>(),
+        )?;
+        for (ratio, indices, lengths) in [
+            (1, &names.c1_indices, &names.c1_lengths),
+            (2, &names.c2_indices, &names.c2_lengths),
+        ] {
+            if let Some(block) = names.draft_block {
+                if !(1..=crate::execution::MAX_MTP_DRAFTS).contains(&block) || rows != block {
+                    return Err(
+                        "DSpark coordinates require one complete declared owner block".into(),
+                    );
+                }
+                let capacity = 128 / ratio;
+                let mut ids = vec![-1; rows * capacity];
+                for row in 0..rows {
+                    for lane in 0..block {
+                        ids[row * capacity + lane] = lane as i32;
+                    }
+                }
+                put(&mut inputs, indices, &ints(&ids))?;
+                put(&mut inputs, lengths, &ints(&vec![block as i32; rows]))?;
+                continue;
+            }
+            if names.device_indices {
+                if minimum.is_some() {
+                    let lens = (0..rows)
+                        .map(|row| ((base + row + 1) / ratio) as i32)
+                        .collect::<Vec<_>>();
+                    put(&mut inputs, lengths, &ints(&lens))?;
+                }
+                continue;
+            }
+            let capacity = self.capacity / ratio;
+            let mut ids = vec![-1; rows * capacity];
+            let mut lens = vec![0; rows];
+            for row in 0..rows {
+                let count = (base + row + 1) / ratio;
+                lens[row] = count as i32;
+                for slot in 0..count {
+                    ids[row * capacity + slot] = slot as i32;
+                }
+            }
+            put(&mut inputs, indices, &ints(&ids))?;
+            put(&mut inputs, lengths, &ints(&lens))?;
+        }
+        Ok(inputs)
+    }
+    pub(super) fn prepare_rows(&mut self, rows: usize) -> Result<()> {
+        if !self.packets.contains_key(&rows) {
+            let packet = self
+                .packet_templates
+                .iter()
+                .filter(|p| p.min_rows > 0 && (p.min_rows..=p.dispatch_max()).contains(&rows))
+                .min_by_key(|p| p.dispatch_max())
+                .cloned()
+                .ok_or_else(|| format!("No A2 packet for {rows} rows"))?;
+            let base = self.package.clone();
+            let body = self.compile(&packet.body, &base, self.snapshots, (packet.rows, rows))?;
+            let head = self.compile(&packet.head, &base, self.snapshots, (packet.rows, rows))?;
+            self.packets.insert(
+                rows,
+                Rc::new(Execution {
+                    packet,
+                    body,
+                    head,
+                    captured: true,
+                    direct_uses: std::cell::Cell::new(0),
+                }),
+            );
+        }
+        self.touch_packet(rows);
+        Ok(())
+    }
+
+    pub(super) fn forward(
+        &mut self,
+        history: &[u32],
+        tokens: &[u32],
+        logits: bool,
+        trace: Option<&Path>,
+    ) -> Result<Option<Best>> {
+        let rows = tokens.len();
+        let execution = self
+            .packets
+            .get(&rows)
+            .cloned()
+            .ok_or("A2 packet extent must be prepared before request reset")?;
+        let t = Instant::now();
+        self.coordinate(&execution.packet.coordinates, history.len(), rows)?;
+        let coordinate = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let mut hashes = vec![];
+        let mut valid = vec![];
+        self.hasher
+            .hash_into(history, tokens, &mut hashes, &mut valid)?;
+        let hash = t.elapsed().as_secs_f64();
+        let batched = trace.is_none()
+            && std::env::var_os("THORUSTINFER_A2_SYNC_PROFILE").is_none()
+            && std::env::var_os("THORUSTINFER_A2_STEP_FENCES").is_none()
+            && !execution
+                .body
+                .iter()
+                .chain(&execution.head)
+                .any(|s| matches!(s, Step::Route { .. }));
+        let t = Instant::now();
+        if batched {
+            self.enqueue_packet(Rc::clone(&execution), tokens, &hashes, &valid, logits)?;
+        } else {
+            for step in &execution.body {
+                self.step(step, tokens, &hashes, &valid, history.len(), trace)?;
+            }
+        }
+        let body = t.elapsed().as_secs_f64();
+        if !logits {
+            self.session.synchronize()?;
+            let stats = self.steps.entry(rows).or_default();
+            stats.forwards += 1;
+            stats.coordinate_s += coordinate;
+            stats.hash_s += hash;
+            stats.body_s += body;
+            return Ok(None);
+        }
+        let t = Instant::now();
+        if !batched {
+            for step in &execution.head {
+                self.step(step, tokens, &hashes, &valid, history.len(), trace)?;
+            }
+        }
+        let head = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let raw_value =
+            self.session
+                .download(&get(&self.buffers, &execution.packet.best_value)?, 0, 4)?;
+        let raw_index =
+            self.session
+                .download(&get(&self.buffers, &execution.packet.best_index)?, 0, 4)?;
+        let download = t.elapsed().as_secs_f64();
+        let value = f32::from_le_bytes(raw_value.try_into().unwrap());
+        let local = i32::from_le_bytes(raw_index.try_into().unwrap());
+        if let Some(directory) = std::env::var_os("THORUSTINFER_A2_LOGITS_DIR") {
+            let name = execution
+                .packet
+                .logits
+                .as_ref()
+                .ok_or("Logit diagnostics require a packet with a declared logits buffer")?;
+            let buffer = get(&self.buffers, name)?;
+            if buffer.bytes() != 16160 * 4 {
+                return Err("Diagnostic logits must contain one FP32 vocabulary shard".into());
+            }
+            let directory = Path::new(&directory);
+            fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+            let values = self.session.download(&buffer, 0, buffer.bytes())?;
+            fs::write(
+                directory.join(format!("r{}-p{}-m{rows}.bin", self.rank, history.len())),
+                values,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if !value.is_finite() || !(0..16160).contains(&local) {
+            return Err("Nonfinite/invalid native model output".into());
+        }
+        let stats = self.steps.entry(rows).or_default();
+        stats.forwards += 1;
+        stats.coordinate_s += coordinate;
+        stats.hash_s += hash;
+        stats.body_s += body;
+        stats.head_s += head;
+        stats.download_s += download;
+        Ok(Some(Best {
+            value,
+            token: execution.packet.vocab_first + local as u32,
+        }))
+    }
+    /// One completion owns every graph, ACLNN executor and native operand in
+    /// this invocation. Input uploads have their own retained pinned backing
+    /// and join the same compute stream at their original layer boundaries.
+    fn enqueue_packet(
+        &mut self,
+        execution: Rc<Execution>,
+        tokens: &[u32],
+        hashes: &[i64],
+        valid: &[bool],
+        logits: bool,
+    ) -> Result<Ticket> {
+        self.enqueue_packet_retained(
+            execution,
+            Inputs {
+                tokens,
+                hashes,
+                valid,
+                visual_rows: &[],
+                device: None,
+                first: None,
+                next: None,
+            },
+            logits,
+            vec![],
+        )
+    }
+    pub(super) fn enqueue_packet_retained(
+        &mut self,
+        execution: Rc<Execution>,
+        input: Inputs<'_>,
+        logits: bool,
+        retained: Vec<Buffer>,
+    ) -> Result<Ticket> {
+        let Inputs {
+            tokens,
+            hashes,
+            valid,
+            visual_rows,
+            device,
+            first,
+            next,
+        } = input;
+        let head = if logits {
+            execution.head.as_slice()
+        } else {
+            &[]
+        };
+        let mut embeddings = vec![];
+        let mut device_embeddings = vec![];
+        for step in execution.body.iter().chain(head) {
+            let input = match step {
+                Step::Embed {
+                    destination,
+                    tensor,
+                    first_column,
+                    columns,
+                } => {
+                    if device.as_ref().is_some_and(|d| d.device_embedding) && visual_rows.is_empty()
+                    {
+                        device_embeddings.push(
+                            self.device_inputs
+                                .as_mut()
+                                .ok_or("Missing device input runtime")?
+                                .embedding(&self.session, step, &execution.packet, tokens.len())?,
+                        );
+                        continue;
+                    }
+                    let mut data = self.embedding(tensor, tokens, *first_column, *columns)?;
+                    for overlay in visual_rows {
+                        overlay.apply(*first_column, *columns, &mut data)?;
+                    }
+                    Some((destination, data))
+                }
+                _ => None,
+            };
+            if let Some((destination, data)) = input {
+                embeddings.push(vec![(destination.slice(0, data.len())?, data)])
+            }
+        }
+        let mut embeddings = embeddings.into_iter();
+        let mut device_embeddings = device_embeddings.iter();
+        // SAFETY: Execution owns the stable graphs and W4 plans; each graph
+        // retains its kernels/collectives, and W4 retains tensors/workspace.
+        // submit_compute fences partial submission on failure. Each forward
+        // completes before these packet resources can be invoked again.
+        unsafe {
+            self.session.submit_compute(
+                vec![],
+                Box::new((
+                    Rc::clone(&execution),
+                    retained,
+                    execution.shared_graphs(),
+                    device.clone(),
+                    device_embeddings.clone().cloned().collect::<Vec<_>>(),
+                )),
+                |stream| {
+                    if let Some(device) = &device {
+                        for kernel in &device.kernels {
+                            kernel.launch_on_stream(stream)?;
+                        }
+                        if let Some(name) = &execution.packet.coordinates.input_ids {
+                            self.session.copy(
+                                &device.ids,
+                                0,
+                                &get(&self.buffers, name)?,
+                                0,
+                                tokens.len() * 4,
+                            )?;
+                        }
+                    }
+                    let head = if logits {
+                        execution.head.as_slice()
+                    } else {
+                        &[]
+                    };
+                    for step in execution.body.iter().chain(head) {
+                        match step {
+                            Step::Graph(graph) => graph.execute_on_stream(stream)?,
+                            Step::Segment(segment) => segment.execute_on_stream(stream)?,
+                            Step::W4(plan) => plan.execute_on_stream(stream)?,
+                            Step::Embed { .. } => {
+                                if device.as_ref().is_some_and(|d| d.device_coordinates)
+                                    && let Some(decoder) = &execution.packet.decoder_coordinates
+                                {
+                                    // The existing causal-index prologue has
+                                    // produced full-context lengths. Continue
+                                    // packets share its row domain with replay.
+                                    let source = &execution.packet.coordinates;
+                                    let copies = [
+                                        (&source.c1_lengths, &decoder.c1_lengths),
+                                        (&source.c2_lengths, &decoder.c2_lengths),
+                                    ]
+                                    .into_iter()
+                                    .map(|(s, d)| {
+                                        Ok((
+                                            get(&self.buffers, s)?,
+                                            0,
+                                            get(&self.buffers, d)?,
+                                            0,
+                                            tokens.len() * 4,
+                                        ))
+                                    })
+                                    .collect::<Result<Vec<_>>>()?;
+                                    self.session.copy_many(&copies)?;
+                                }
+                                if device.as_ref().is_some_and(|d| d.device_embedding)
+                                    && visual_rows.is_empty()
+                                {
+                                    device_embeddings
+                                        .next()
+                                        .ok_or("Device embedding missing")?
+                                        .launch_on_stream(stream)?;
+                                } else {
+                                    self.session.upload_inputs(
+                                        &embeddings.next().ok_or("Packet embedding missing")?,
+                                    )?;
+                                }
+                            }
+                            Step::Lookup {
+                                layer,
+                                values,
+                                scales,
+                                mask,
+                            } => {
+                                if let Some(first) = first.filter(|f| f.layer == *layer) {
+                                    let table =
+                                        self.tables.get(layer).ok_or("Engram table missing")?;
+                                    let data = first.get(
+                                        table,
+                                        || self.lookup_ids(*layer, tokens.len(), hashes, valid),
+                                        valid,
+                                    )?;
+                                    let buffers = [values, scales, mask];
+                                    let regions = data
+                                        .regions()
+                                        .map(|(plane, offset, bytes)| {
+                                            (Buffer::clone(buffers[plane]), offset, bytes)
+                                        })
+                                        .collect::<Vec<_>>();
+                                    self.session.upload_regions(&regions)?;
+                                    // This frame now owns its immutable bytes; a
+                                    // future read can replace the store cache
+                                    // while late ranks consume the same frame.
+                                    if let Some(next) = next {
+                                        next.start();
+                                    }
+                                    continue;
+                                }
+                                // Earlier graph segments are already queued.
+                                // Prepare CPU rows while they execute, then
+                                // update reused inputs at this stream boundary.
+                                let inputs = self.lookup_inputs(
+                                    *layer,
+                                    tokens.len(),
+                                    hashes,
+                                    valid,
+                                    values,
+                                    scales,
+                                    mask,
+                                )?;
+                                self.session.upload_inputs(&inputs)?;
+                            }
+                            Step::Snapshot { .. } => {}
+                            Step::Route { .. } => {
+                                return Err("Host routing requires step completions".into());
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+            )
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn trace_packet(
+        &mut self,
+        execution: &Execution,
+        tokens: &[u32],
+        hashes: &[i64],
+        valid: &[bool],
+        head: bool,
+        path: &Path,
+        visual_rows: &[super::vision::Overlay],
+    ) -> Result<()> {
+        let trace = (self.rank == 0
+            || std::env::var_os("THORUSTINFER_A2_BATCH_TRACE_ALL_RANKS").is_some())
+        .then_some(path);
+        for step in execution
+            .body
+            .iter()
+            .chain(if head { execution.head.as_slice() } else { &[] })
+        {
+            if let Step::Embed {
+                destination,
+                tensor,
+                first_column,
+                columns,
+            } = step
+            {
+                let mut data = self.embedding(tensor, tokens, *first_column, *columns)?;
+                for overlay in visual_rows {
+                    overlay.apply(*first_column, *columns, &mut data)?;
+                }
+                upload(&self.session, &destination.slice(0, data.len())?, &data)?;
+            } else {
+                self.step(step, tokens, hashes, valid, 0, trace)?;
+            }
+        }
+        self.session.synchronize()
+    }
+    /// Prints and clears per-row-count step accounting for this rank.
+    pub(super) fn report_steps(&mut self) {
+        for (rows, s) in std::mem::take(&mut self.steps) {
+            if s.forwards == 0 {
+                continue;
+            }
+            let n = s.forwards as f64;
+            let ms = |v: f64| v * 1000.0 / n;
+            let each = |c: (usize, f64)| (c.0 as f64 / n, c.1 * 1000.0 / n);
+            let (gn, gt) = each(s.graph);
+            let (rn, rt) = each(s.reduce);
+            let (wn, wt) = each(s.w4);
+            let (un, ut) = each(s.route);
+            let (ln, lt) = each(s.lookup);
+            eprintln!(
+                "A2 rank {} rows={rows} x{} avg: coordinate={:.2}ms hash={:.3}ms body={:.2}ms head={:.2}ms dl={:.2}ms | graph {:.0}x{:.3}ms reduce {:.0}x{:.3}ms w4 {:.0}x{:.3}ms route {:.0}x{:.2}ms(dl={:.2} cpu={:.3} up={:.2} grp={:.2}) lookup {:.0}x{:.2}ms embed={:.3}ms",
+                self.rank,
+                s.forwards,
+                ms(s.coordinate_s),
+                ms(s.hash_s),
+                ms(s.body_s),
+                ms(s.head_s),
+                ms(s.download_s),
+                gn,
+                gt,
+                rn,
+                rt,
+                wn,
+                wt,
+                un,
+                ut,
+                ms(s.route_dl.1),
+                ms(s.route_cpu.1),
+                ms(s.route_up.1),
+                ms(s.route_grp.1),
+                ln,
+                lt,
+                ms(s.embed.1),
+            );
+        }
+    }
+    fn step(
+        &mut self,
+        step: &Step,
+        tokens: &[u32],
+        hashes: &[i64],
+        valid: &[bool],
+        position: usize,
+        trace: Option<&Path>,
+    ) -> Result<()> {
+        // Synchronized profiling isolates device execution per step type by
+        // fencing after every submission; it changes timing, not values.
+        if std::env::var_os("THORUSTINFER_A2_SYNC_PROFILE").is_some() {
+            let t = Instant::now();
+            let submission = match step {
+                Step::Graph(program) => program.enqueue(&self.session).map(|_| ()),
+                Step::Segment(segment) => segment.enqueue(&self.session).map(|_| ()),
+                Step::W4(plan) => plan.enqueue(&self.session).map(|_| ()),
+                _ => Ok(()),
+            };
+            let result = submission.and_then(|()| self.session.synchronize());
+            let elapsed = t.elapsed().as_secs_f64();
+            let stats = self.steps.entry(tokens.len()).or_default();
+            match step {
+                Step::Graph(_) | Step::Segment(_) => {
+                    stats.graph.0 += 1;
+                    stats.graph.1 += elapsed;
+                }
+                Step::W4(_) => {
+                    stats.w4.0 += 1;
+                    stats.w4.1 += elapsed;
+                }
+                _ => {}
+            }
+            if matches!(step, Step::Graph(_) | Step::Segment(_) | Step::W4(_)) {
+                return result;
+            }
+            result?;
+        }
+        let t = Instant::now();
+        let result = self.step_inner(step, tokens, hashes, valid, position, trace);
+        let elapsed = t.elapsed().as_secs_f64();
+        let rows = tokens.len();
+        let stats = self.steps.entry(rows).or_default();
+        match step {
+            Step::Graph(_) | Step::Segment(_) => {
+                stats.graph.0 += 1;
+                stats.graph.1 += elapsed;
+            }
+            Step::W4(_) => {}
+            Step::Route { .. } => {
+                stats.route.0 += 1;
+                stats.route.1 += elapsed;
+            }
+            Step::Lookup { .. } => {
+                stats.lookup.0 += 1;
+                stats.lookup.1 += elapsed;
+            }
+            Step::Embed { .. } => {
+                stats.embed.0 += 1;
+                stats.embed.1 += elapsed;
+            }
+            Step::Snapshot { .. } => {}
+        }
+        result
+    }
+    fn step_inner(
+        &mut self,
+        step: &Step,
+        tokens: &[u32],
+        hashes: &[i64],
+        valid: &[bool],
+        position: usize,
+        trace: Option<&Path>,
+    ) -> Result<()> {
+        match step {
+            Step::Graph(program) => {
+                program.enqueue(&self.session)?;
+            }
+            Step::Segment(segment) => {
+                segment.enqueue(&self.session)?;
+            }
+            Step::W4(plan) => {
+                plan.enqueue(&self.session)?;
+            }
+            Step::Route {
+                indices,
+                gather,
+                restore,
+                groups,
+                rows,
+            } => {
+                let t = Instant::now();
+                let ids = self.session.download(indices, 0, indices.bytes())?;
+                let dl = t.elapsed().as_secs_f64();
+                let t = Instant::now();
+                let ids = ids
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|x| i32::from_le_bytes(*x))
+                    .collect::<Vec<_>>();
+                if ids.len() != rows * 8
+                    || (0..*rows).any(|row| {
+                        ids[row * 8..row * 8 + 6]
+                            .iter()
+                            .any(|id| !(0..384).contains(id))
+                    })
+                {
+                    return Err(format!(
+                        "Invalid expert routes for rank {} in {groups:?}",
+                        self.rank
+                    ));
+                }
+
+                let mut selected = vec![-1; rows * 6];
+                let mut map = vec![-1; rows * 8];
+                let mut ends = vec![0i64; 48];
+                let mut count = 0;
+                for (local, end) in ends.iter_mut().enumerate() {
+                    let expert = (self.rank as usize * 48 + local) as i32;
+                    for row in 0..*rows {
+                        for route in 0..6 {
+                            if ids[row * 8 + route] == expert {
+                                selected[count] = row as i32;
+                                map[row * 8 + route] = count as i32;
+                                count += 1;
+                            }
+                        }
+                    }
+                    *end = count as i64;
+                }
+                let cpu = t.elapsed().as_secs_f64();
+                // Unreferenced zero rows pad the fixed expert packet. Their
+                // final bank is never restored into a real token output.
+                ends[47] = (rows * 6) as i64;
+                let t = Instant::now();
+                upload(&self.session, gather, &ints(&selected))?;
+                upload(&self.session, restore, &ints(&map))?;
+                let up = t.elapsed().as_secs_f64();
+                let t = Instant::now();
+                for name in groups {
+                    self.routed_w4
+                        .get(name)
+                        .and_then(|(_, plan)| plan.upgrade())
+                        .ok_or("Routed W4 binding missing")?
+                        .update_groups(&self.session, &ends)?;
+                }
+                let grp = t.elapsed().as_secs_f64();
+                let stats = self.steps.entry(*rows).or_default();
+                stats.route_dl.0 += 1;
+                stats.route_dl.1 += dl;
+                stats.route_cpu.0 += 1;
+                stats.route_cpu.1 += cpu;
+                stats.route_up.0 += 1;
+                stats.route_up.1 += up;
+                stats.route_grp.0 += 1;
+                stats.route_grp.1 += grp;
+            }
+            Step::Embed {
+                destination,
+                tensor,
+                first_column,
+                columns,
+            } => {
+                let values = self.embedding(tensor, tokens, *first_column, *columns)?;
+                self.session
+                    .upload_inputs(&[(destination.slice(0, values.len())?, values)])?;
+            }
+            Step::Lookup {
+                layer,
+                values,
+                scales,
+                mask,
+            } => {
+                let inputs =
+                    self.lookup_inputs(*layer, tokens.len(), hashes, valid, values, scales, mask)?;
+                self.session.upload_inputs(&inputs)?;
+            }
+            Step::Snapshot { name, buffer } => {
+                if let Some(base) = trace {
+                    let base = if self.rank == 0 {
+                        base.to_owned()
+                    } else {
+                        base.join(format!("rank{}", self.rank))
+                    };
+                    fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+                    let data = self.session.download(buffer, 0, buffer.bytes())?;
+                    fs::write(base.join(format!("p{position}-{name}.bin")), data)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn embedding(
+        &mut self,
+        tensor: &str,
+        tokens: &[u32],
+        first: usize,
+        columns: usize,
+    ) -> Result<Vec<u8>> {
+        let span = embedding_span(first, columns)?;
+        let embedding = self.checkpoint.read(tensor)?;
+        if embedding.dtype != Dtype::BF16 || embedding.shape != [129280, 5120] {
+            return Err("Embedding checkpoint layout differs".into());
+        }
+        let mut values = Vec::with_capacity(tokens.len() * span.len());
+        for &token in tokens {
+            let start = token as usize * 10240;
+            values.extend_from_slice(
+                embedding
+                    .data
+                    .get(start + span.start..start + span.end)
+                    .ok_or("Embedding token out of range")?,
+            );
+        }
+        Ok(values)
+    }
+    fn lookup_ids(
+        &self,
+        layer: usize,
+        rows: usize,
+        hashes: &[i64],
+        valid: &[bool],
+    ) -> Result<Vec<u64>> {
+        let layer_index = self
+            .hasher
+            .layout()
+            .layers
+            .iter()
+            .position(|l| l.layer == layer)
+            .ok_or("Engram layer missing")?;
+        let width = self.hasher.values_per_token();
+        let mut ids = Vec::with_capacity(rows * 24);
+        for (row, &active) in valid.iter().enumerate() {
+            for lane in 0..24 {
+                ids.push(if active {
+                    hashes[row * width + layer_index * 24 + lane] as u64
+                } else {
+                    0
+                });
+            }
+        }
+        Ok(ids)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn lookup_inputs(
+        &self,
+        layer: usize,
+        rows: usize,
+        hashes: &[i64],
+        valid: &[bool],
+        values: &Buffer,
+        scales: &Buffer,
+        mask: &Buffer,
+    ) -> Result<Vec<(Buffer, Vec<u8>)>> {
+        let ids = self.lookup_ids(layer, rows, hashes, valid)?;
+        let table = self.tables.get(&layer).ok_or("Engram table missing")?;
+        let packed = table.gather(&ids, rows * 24 * 288)?;
+        let mut q = Vec::with_capacity(rows * 24 * 256);
+        let mut scale = Vec::with_capacity(rows * 24 * 32);
+        for data in packed.as_chunks::<288>().0.iter() {
+            q.extend_from_slice(&data[..256]);
+            scale.extend_from_slice(&data[256..]);
+        }
+        Ok(vec![
+            (values.slice(0, q.len())?, q),
+            (scales.slice(0, scale.len())?, scale),
+            (
+                mask.slice(0, valid.len())?,
+                valid.iter().map(|&v| u8::from(v)).collect(),
+            ),
+        ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::embedding_span;
+
+    #[test]
+    fn embedding_instructions_keep_full_row_defaults_and_explicit_column_shards() {
+        use super::super::Instruction;
+
+        let full: Instruction =
+            serde_json::from_str(r#"{"op":"embed","destination":"x"}"#).unwrap();
+        assert!(matches!(
+            full,
+            Instruction::Embed {
+                first_column: 0,
+                columns: 5120,
+                ..
+            }
+        ));
+        let shard: Instruction = serde_json::from_str(
+            r#"{"op":"embed","destination":"x","first_column":4480,"columns":640}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            shard,
+            Instruction::Embed {
+                first_column: 4480,
+                columns: 640,
+                ..
+            }
+        ));
+        let draft: Instruction = serde_json::from_str(
+            r#"{"op":"embed","destination":"x","tensor":"mtp.0.embed.weight"}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(draft, Instruction::Embed { tensor, .. } if tensor == "mtp.0.embed.weight")
+        );
+    }
+
+    #[test]
+    fn embedding_column_shards_cover_original_bf16_bytes_and_reject_invalid_spans() {
+        let mut bytes = vec![];
+        for rank in 0..8 {
+            bytes.extend(embedding_span(rank * 640, 640).unwrap());
+        }
+        assert_eq!(bytes, (0..10240).collect::<Vec<_>>());
+        assert_eq!(embedding_span(0, 5120).unwrap(), 0..10240);
+        assert!(embedding_span(5120, 1).is_err());
+        assert!(embedding_span(0, 0).is_err());
+        assert!(embedding_span(usize::MAX, 1).is_err());
+    }
+}

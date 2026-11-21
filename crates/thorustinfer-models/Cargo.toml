@@ -1,0 +1,23 @@
+[package]
+name = "thorustinfer-models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+thorustinfer-model-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+half.workspace = true
+sha2.workspace = true
+hex.workspace = true
+memmap2 = "=0.9.12"
+safetensors = "=0.8.0"

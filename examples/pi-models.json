@@ -1,0 +1,63 @@
+{
+  "providers": {
+    "thorustinfer": {
+      "baseUrl": "http://127.0.0.1:8088/v1",
+      "api": "openai-completions",
+      "apiKey": "thorustinfer-local",
+      "models": [
+        {
+          "id": "qwen3.8-27b",
+          "name": "Qwen3.8 27B on thorustinfer",
+          "reasoning": true,
+          "input": [
+            "text",
+            "image"
+          ],
+          "contextWindow": 262144,
+          "maxTokens": 8192,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          "compat": {
+            "supportsReasoningEffort": true,
+            "supportsUsageInStreaming": true,
+            "supportsStrictMode": true,
+            "supportsLongCacheRetention": false
+          },
+          "thinkingLevelMap": {
+            "off": "none"
+          }
+        },
+        {
+          "id": "qwen-flash-next",
+          "name": "Qwen3.8 Flash Next on thorustinfer",
+          "reasoning": true,
+          "input": [
+            "text",
+            "image"
+          ],
+          "contextWindow": 262144,
+          "maxTokens": 8192,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          "compat": {
+            "supportsReasoningEffort": true,
+            "supportsUsageInStreaming": true,
+            "supportsStrictMode": true,
+            "supportsLongCacheRetention": false
+          },
+          "thinkingLevelMap": {
+            "off": "none"
+          }
+        }
+      ]
+    }
+  }
+}

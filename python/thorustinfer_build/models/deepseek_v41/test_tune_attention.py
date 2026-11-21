@@ -1,0 +1,71 @@
+"""Offline schedule candidates preserve the published attention baseline."""
+
+from copy import deepcopy
+import unittest
+
+from thorustinfer_build.models.deepseek_v41.tune_attention import attention_configs, select_schedule
+
+
+class AttentionTuningTests(unittest.TestCase):
+    def test_dma_search_keeps_the_published_math_and_supports_retuning(self):
+        original = dict(softmax_heads=4, tile_slots=16, reuse_long=True)
+        configs = attention_configs(original, gather_pipeline=True)
+        self.assertEqual(configs, {"baseline": {}, "async-gather": dict(async_gather=True)})
+        enabled = dict(original, async_gather=True)
+        self.assertEqual(
+            attention_configs(enabled, gather_pipeline=True),
+            {"baseline": {}, "sync-gather": dict(async_gather=False)},
+        )
+        self.assertEqual(
+            attention_configs(dict(original, tile_slots=1), gather_pipeline=True),
+            {"baseline": {}},
+        )
+
+    def test_scale_dma_search_keeps_the_kv_and_softmax_geometry(self):
+        params = dict(softmax_heads=4, tile_slots=16, async_gather=True, reuse_long=True)
+        self.assertEqual(
+            attention_configs(params, scale_dma=True),
+            {"baseline": {}, "scale-dma": dict(dma_scales=True)},
+        )
+        self.assertEqual(
+            attention_configs(dict(params, dma_scales=True), scale_dma=True),
+            {"baseline": {}, "scalar-scales": dict(dma_scales=False)},
+        )
+        for updates in [dict(tile_slots=1), dict(staged_swa=True)]:
+            self.assertEqual(
+                attention_configs(dict(params, **updates), scale_dma=True), {"baseline": {}}
+            )
+
+    def test_existing_four_head_schedule_remains_the_baseline(self):
+        parameters = dict(softmax_heads=4, tile_slots=16, reuse_long=True)
+        original = deepcopy(parameters)
+        configs = attention_configs(parameters)
+        self.assertEqual(configs["baseline"], {})
+        self.assertEqual(set(configs), {"baseline", "head-1", "head-8"})
+        self.assertEqual(parameters, original)
+        for update in configs.values():
+            self.assertTrue(dict(parameters, **update)["reuse_long"])
+            self.assertEqual(dict(parameters, **update)["tile_slots"], 16)
+
+    def test_schedule_rejects_an_outlier_even_with_a_large_mean_gain(self):
+        records = [
+            dict(rows=64, times={"baseline": 10.0, "head-8": 12.0}),
+            dict(rows=256, times={"baseline": 20.0, "head-8": 10.0}),
+        ]
+        self.assertEqual(select_schedule(records), "baseline")
+
+    def test_small_timing_noise_keeps_the_published_schedule(self):
+        self.assertEqual(
+            select_schedule([dict(rows=64, times={"baseline": 10.0, "head-8": 9.9})]),
+            "baseline",
+        )
+
+    def test_useful_gain_selects_a_legal_schedule(self):
+        self.assertEqual(
+            select_schedule([dict(rows=64, times={"baseline": 10.0, "head-8": 8.0})]),
+            "head-8",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,406 @@
+//! Versioned, fixed-shape AOT fixtures. This is not the model manifest format.
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::{Component, Path},
+    time::Instant,
+};
+
+pub type Result<T> = std::result::Result<T, String>;
+pub use crate::backend::cuda::RunReport;
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Manifest {
+    pub schema_version: u32,
+    pub target: String,
+    pub toolchain: BTreeMap<String, String>,
+    pub buffers: Vec<Buffer>,
+    pub kernels: Vec<Kernel>,
+    pub validation: Validation,
+}
+
+pub use thorustinfer_model_sdk::artifact::{
+    Access, Argument, AssetKey, Buffer, Dtype, FileIdentity, Kernel, is_sha256_hex,
+};
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Validation {
+    pub output: String,
+    pub reference: FileIdentity,
+    pub relative_l2_tolerance: f64,
+    pub zero_input: String,
+    pub repetitions: u32,
+}
+
+impl Manifest {
+    pub fn validate(&self) -> Result<usize> {
+        let target = thorustinfer_device::Target::from_package(&self.target)?;
+        if self.schema_version != 1 || target.backend != thorustinfer_device::Backend::Cuda {
+            return Err("Expected fixture schema 1 and a supported CUDA target".into());
+        }
+        if self.toolchain.is_empty() || self.buffers.is_empty() || self.kernels.is_empty() {
+            return Err("Missing toolchain/buffers/kernels".into());
+        }
+        let mut names = BTreeSet::new();
+        let mut bytes = 0usize;
+        for b in &self.buffers {
+            if b.name.is_empty() || !names.insert(b.name.as_str()) {
+                return Err("Duplicate/empty buffer name".into());
+            }
+            if b.layout.is_empty() || !b.alignment.is_power_of_two() || b.alignment > 256 {
+                return Err(format!("{}: unsupported layout/alignment", b.name));
+            }
+            bytes = bytes
+                .checked_add(b.bytes()?)
+                .ok_or("Total buffer size overflow")?;
+        }
+        for k in &self.kernels {
+            k.validate_launch(&target)?;
+            if k.name.is_empty()
+                || k.symbol.is_empty()
+                || k.symbol.contains('\0')
+                || k.args.is_empty()
+            {
+                return Err("Invalid kernel name/symbol/arguments".into());
+            }
+            if k.cooperative {
+                return Err("Cooperative launch is not supported by fixture runner".into());
+            }
+            for a in &k.args {
+                match a {
+                    Argument::Buffer { name } | Argument::BufferSlice { name, .. }
+                        if !names.contains(name.as_str()) =>
+                    {
+                        return Err(format!("{}: unknown buffer {name}", k.name));
+                    }
+                    Argument::F32 { value } if !value.is_finite() => {
+                        return Err("Nonfinite scalar".into());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let v = &self.validation;
+        if !(v.relative_l2_tolerance.is_finite() && (0.0..=1.0).contains(&v.relative_l2_tolerance))
+            || v.repetitions == 0
+            || v.repetitions > 1000
+        {
+            return Err("Invalid validation tolerance/repetitions".into());
+        }
+        let out = self
+            .buffers
+            .iter()
+            .find(|b| b.name == v.output)
+            .ok_or("Unknown validation output")?;
+        if !matches!(out.dtype, Dtype::F16 | Dtype::Bf16 | Dtype::F32) || out.access == Access::Read
+        {
+            return Err("Validation output must be writable f16/bf16/f32".into());
+        }
+        if v.zero_input == v.output || !names.contains(v.zero_input.as_str()) {
+            return Err("Invalid changed-input buffer".into());
+        }
+        let input = self
+            .buffers
+            .iter()
+            .find(|b| b.name == v.zero_input)
+            .unwrap();
+        if input.data.is_none() {
+            return Err("Changed input requires original data".into());
+        }
+        Ok(bytes)
+    }
+}
+
+pub(crate) struct Loaded {
+    pub manifest: Manifest,
+    pub files: BTreeMap<AssetKey, Vec<u8>>,
+    pub manifest_sha256: String,
+    pub validation_s: f64,
+    pub buffer_bytes: usize,
+}
+
+pub fn sha256(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+#[derive(Default)]
+pub(crate) struct AssetReader {
+    bundles: BTreeMap<std::path::PathBuf, (memmap2::Mmap, usize, safetensors::tensor::Metadata)>,
+}
+impl AssetReader {
+    pub(crate) fn read(&mut self, base: &Path, id: &FileIdentity) -> Result<Vec<u8>> {
+        let data = self.read_unverified(base, id)?;
+        let actual = sha256(&data);
+        if actual != id.sha256 {
+            return Err(format!(
+                "{}: sha256 mismatch (expected {}, got {actual}, {} bytes)",
+                id.file,
+                id.sha256,
+                data.len()
+            ));
+        }
+        Ok(data)
+    }
+
+    /// Runtime loading checks containers and ranges; validate-model checks content.
+    pub(crate) fn read_unverified(&mut self, base: &Path, id: &FileIdentity) -> Result<Vec<u8>> {
+        let canonical = resolve_file(base, &id.file)?;
+        let data = if let Some(name) = &id.tensor {
+            if name.is_empty() {
+                return Err("Empty bundled asset name".into());
+            }
+            if !self.bundles.contains_key(&canonical) {
+                let file = fs::File::open(&canonical).map_err(|e| e.to_string())?;
+                // SAFETY: execution assets are immutable for the model lifetime.
+                let mapping =
+                    unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|e| e.to_string())?;
+                let (header, metadata) =
+                    safetensors::SafeTensors::read_metadata(&mapping).map_err(|e| e.to_string())?;
+                self.bundles
+                    .insert(canonical.clone(), (mapping, 8 + header, metadata));
+            }
+            let (mapping, start, metadata) = &self.bundles[&canonical];
+            let info = metadata.info(name).ok_or("Missing bundled asset")?;
+            let (begin, end) = info.data_offsets;
+            if info.dtype != safetensors::Dtype::U8 || info.shape != [end - begin] || begin == end {
+                return Err("Bundled asset must be a nonempty U8 vector".into());
+            }
+            mapping[start + begin..start + end].to_vec()
+        } else {
+            fs::read(&canonical).map_err(|e| format!("{}: {e}", id.file))?
+        };
+        Ok(data)
+    }
+}
+
+pub(crate) fn read_identity(base: &Path, id: &FileIdentity) -> Result<Vec<u8>> {
+    AssetReader::default().read(base, id)
+}
+
+pub(crate) fn read_asset(base: &Path, id: &FileIdentity) -> Result<Vec<u8>> {
+    AssetReader::default().read_unverified(base, id)
+}
+
+pub(crate) fn resolve_file(base: &Path, file: &str) -> Result<std::path::PathBuf> {
+    let path = Path::new(file);
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return Err(format!("{file}: expected relative artifact path"));
+    }
+    let canonical = base
+        .join(path)
+        .canonicalize()
+        .map_err(|e| format!("{file}: {e}"))?;
+    if !canonical.starts_with(base) {
+        return Err("Artifact symlink leaves fixture directory".into());
+    }
+    Ok(canonical)
+}
+
+fn load(path: &Path) -> Result<Loaded> {
+    let start = Instant::now();
+    let raw = fs::read(path).map_err(|e| e.to_string())?;
+    let manifest: Manifest = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+    let buffer_bytes = manifest.validate()?;
+    let base = path
+        .canonicalize()
+        .map_err(|e| e.to_string())?
+        .parent()
+        .unwrap()
+        .to_owned();
+    let mut files: BTreeMap<AssetKey, Vec<u8>> = BTreeMap::new();
+    let mut reader = AssetReader::default();
+    let mut add = |id: &FileIdentity| -> Result<()> {
+        if let Some(data) = files.get(&id.key()) {
+            if sha256(data) != id.sha256 {
+                return Err("Conflicting file identities".into());
+            }
+        } else {
+            files.insert(id.key(), reader.read(&base, id)?);
+        }
+        Ok(())
+    };
+    for b in &manifest.buffers {
+        if let Some(id) = &b.data {
+            add(id)?;
+        }
+    }
+    for k in &manifest.kernels {
+        for id in [&k.module, &k.source, &k.host_abi] {
+            add(id)?;
+        }
+    }
+    add(&manifest.validation.reference)?;
+    for b in &manifest.buffers {
+        if let Some(id) = &b.data
+            && files[&id.key()].len() != b.bytes()?
+        {
+            return Err(format!("{}: data byte count mismatch", b.name));
+        }
+    }
+    let out = manifest
+        .buffers
+        .iter()
+        .find(|b| b.name == manifest.validation.output)
+        .unwrap();
+    let refbytes = (out.bytes()? / out.dtype.bytes())
+        .checked_mul(4)
+        .ok_or("Reference size overflow")?;
+    if files[&manifest.validation.reference.key()].len() != refbytes {
+        return Err("Reference byte count mismatch".into());
+    }
+    Ok(Loaded {
+        manifest,
+        files,
+        manifest_sha256: sha256(&raw),
+        validation_s: start.elapsed().as_secs_f64(),
+        buffer_bytes,
+    })
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidationReport {
+    pub manifest_sha256: String,
+    pub buffers: usize,
+    pub kernels: usize,
+    pub buffer_bytes: usize,
+    pub validation_s: f64,
+    pub gpu_initialized: bool,
+}
+pub fn validate_artifact(path: &Path) -> Result<ValidationReport> {
+    let x = load(path)?;
+    Ok(ValidationReport {
+        manifest_sha256: x.manifest_sha256,
+        buffers: x.manifest.buffers.len(),
+        kernels: x.manifest.kernels.len(),
+        buffer_bytes: x.buffer_bytes,
+        validation_s: x.validation_s,
+        gpu_initialized: false,
+    })
+}
+pub fn run_artifact(path: &Path) -> Result<RunReport> {
+    crate::backend::cuda::run(load(path)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn sha256_matches_standard_vectors() {
+        assert_eq!(
+            sha256(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+    fn sample() -> Manifest {
+        serde_json::from_value(serde_json::json!({"schema_version":1,"target":"sm_87","toolchain":{"tilelang":"test"},"buffers":[{"name":"A","dtype":"f16","shape":[1,4],"layout":"row_major","alignment":16,"access":"read","data":{"file":"a.bin","sha256":"0".repeat(64)}},{"name":"C","dtype":"f16","shape":[1,4],"layout":"row_major","alignment":16,"access":"write"}],"kernels":[{"name":"test","module":{"file":"k.cubin","sha256":"0".repeat(64)},"source":{"file":"k.cu","sha256":"0".repeat(64)},"host_abi":{"file":"host.txt","sha256":"0".repeat(64)},"symbol":"kernel","grid":[1,1,1],"block":[128,1,1],"shared_memory_bytes":0,"cooperative":false,"args":[{"kind":"buffer","name":"A"},{"kind":"buffer","name":"C"},{"kind":"i32","value":1}]}],"validation":{"output":"C","reference":{"file":"ref.bin","sha256":"0".repeat(64)},"relative_l2_tolerance":0.002,"zero_input":"A","repetitions":20}})).unwrap()
+    }
+    #[test]
+    fn rejects_unsafe_launch_metadata() {
+        let mut x = sample();
+        assert_eq!(x.validate().unwrap(), 16);
+        x.kernels[0].cooperative = true;
+        assert!(x.validate().is_err());
+        x.kernels[0].cooperative = false;
+        x.kernels[0].grid[0] = 0;
+        assert!(x.validate().is_err());
+    }
+    #[test]
+    fn rejects_abi_and_extent_errors() {
+        let mut x = sample();
+        x.kernels[0].args.push(Argument::Buffer {
+            name: "missing".into(),
+        });
+        assert!(x.validate().is_err());
+        let mut x = sample();
+        x.buffers[0].shape = vec![usize::MAX, 2];
+        assert!(x.validate().is_err());
+        let mut x = sample();
+        x.validation.zero_input = "C".into();
+        assert!(x.validate().is_err());
+    }
+    #[test]
+    fn checks_file_hashes_and_directory_boundary() {
+        let dir = std::env::temp_dir().join(format!("orin-artifact-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("data.bin"), [1, 2, 3]).unwrap();
+        let base = dir.canonicalize().unwrap();
+        let mut id = FileIdentity {
+            file: "data.bin".into(),
+            tensor: None,
+            sha256: sha256(&[1, 2, 3]),
+        };
+        assert_eq!(read_identity(&base, &id).unwrap(), [1, 2, 3]);
+        id.sha256 = sha256(&[1, 2, 4]);
+        assert_eq!(read_asset(&base, &id).unwrap(), [1, 2, 3]);
+        assert!(read_identity(&base, &id).is_err());
+        id.file = "../data.bin".into();
+        assert!(read_asset(&base, &id).is_err());
+        assert!(read_identity(&base, &id).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bundled_assets_keep_distinct_keys_and_verify_each_payload() {
+        use safetensors::tensor::TensorView;
+        let dir = std::env::temp_dir().join(format!("orin-bundle-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let raw = safetensors::serialize(
+            [
+                (
+                    "a",
+                    TensorView::new(safetensors::Dtype::U8, vec![3], &[1, 2, 3]).unwrap(),
+                ),
+                (
+                    "b",
+                    TensorView::new(safetensors::Dtype::U8, vec![2], &[4, 5]).unwrap(),
+                ),
+                (
+                    "matrix",
+                    TensorView::new(safetensors::Dtype::U8, vec![1, 2], &[6, 7]).unwrap(),
+                ),
+            ],
+            None,
+        )
+        .unwrap();
+        fs::write(dir.join("assets.safetensors"), &raw).unwrap();
+        let base = dir.canonicalize().unwrap();
+        let mut reader = AssetReader::default();
+        let mut a = FileIdentity {
+            file: "assets.safetensors".into(),
+            tensor: Some("a".into()),
+            sha256: sha256(&[1, 2, 3]),
+        };
+        let b = FileIdentity {
+            tensor: Some("b".into()),
+            sha256: sha256(&[4, 5]),
+            ..a.clone()
+        };
+        assert_ne!(a.key(), b.key());
+        assert_eq!(reader.read(&base, &a).unwrap(), [1, 2, 3]);
+        assert_eq!(reader.read(&base, &b).unwrap(), [4, 5]);
+        assert_eq!(reader.bundles.len(), 1);
+        a.sha256 = b.sha256;
+        assert!(reader.read(&base, &a).is_err());
+        a.tensor = Some("matrix".into());
+        assert!(reader.read(&base, &a).is_err());
+        a.tensor = Some("missing".into());
+        assert!(reader.read(&base, &a).is_err());
+        // Container truncation is rejected by a fresh reader before asset slicing.
+        fs::write(dir.join("truncated.safetensors"), &raw[..raw.len() - 1]).unwrap();
+        a.file = "truncated.safetensors".into();
+        assert!(AssetReader::default().read(&base, &a).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+}

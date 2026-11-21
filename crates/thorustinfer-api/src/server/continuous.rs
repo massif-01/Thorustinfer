@@ -1,0 +1,1125 @@
+//! Continuous worker and bounded, nonblocking per-client output mailboxes.
+use super::*;
+use std::{collections::VecDeque, sync::atomic::AtomicUsize};
+use thorustinfer_engine::{
+    model::{GenerationInput, RequestState},
+    scheduler,
+};
+
+mod pipeline;
+
+#[derive(Default)]
+pub(super) struct Activity {
+    pub lifecycle: Arc<lifecycle::Lifecycle>,
+    pub active: AtomicUsize,
+    pub queued: AtomicUsize,
+    pub statistics: std::sync::Mutex<scheduler::Statistics>,
+    pub admission: std::sync::Mutex<AdmissionStatistics>,
+    pub output_pipeline: std::sync::Mutex<pipeline::Statistics>,
+    pub measurements: std::sync::Mutex<super::metrics::Measurements>,
+}
+
+/// Wall time in admission includes policy, memory checks and request startup.
+#[derive(Default, Clone, serde::Serialize)]
+pub(super) struct AdmissionStatistics {
+    rounds: usize,
+    requests: usize,
+    cached_text_requests: usize,
+    wall_s: f64,
+    max_round_s: f64,
+    histogram: std::collections::BTreeMap<usize, usize>,
+    cold_deferrals: usize,
+    prefix_waits: usize,
+    memory_drain_rounds: usize,
+    deadline_yields: usize,
+}
+
+type Decoder<'a> = tokenizers::tokenizer::DecodeStream<
+    'a,
+    tokenizers::models::ModelWrapper,
+    tokenizers::normalizers::NormalizerWrapper,
+    tokenizers::pre_tokenizers::PreTokenizerWrapper,
+    tokenizers::processors::PostProcessorWrapper,
+    tokenizers::decoders::DecoderWrapper,
+>;
+
+fn token_score(codec: &ChatCodec, score: &thorustinfer_engine::sampling::TokenLogprob) -> Value {
+    let entry = |id: u32, logprob: f64| {
+        let bytes = codec.grammar.token_bytes(id).unwrap_or_default();
+        json!({"token":String::from_utf8_lossy(&bytes),"logprob":logprob,"bytes":bytes})
+    };
+    let mut result = entry(score.token, score.logprob);
+    result["top_logprobs"] = json!(
+        score
+            .top
+            .iter()
+            .map(|&(id, p)| entry(id, p))
+            .collect::<Vec<_>>()
+    );
+    result
+}
+
+struct Mailbox {
+    job: Job,
+    pending: VecDeque<(ModelEvent, usize)>,
+    bytes: usize,
+    failed: bool,
+    progress: Instant,
+}
+impl Mailbox {
+    fn new(job: Job) -> Self {
+        Self {
+            job,
+            pending: VecDeque::new(),
+            bytes: 0,
+            failed: false,
+            progress: Instant::now(),
+        }
+    }
+    fn flush(&mut self) -> bool {
+        if !self.pending.is_empty()
+            && self.progress.elapsed().as_millis() >= self.job.limits.output_ms as u128
+        {
+            self.failed = true;
+            self.pending.clear();
+            self.bytes = 0;
+            let _ = self
+                .job
+                .events
+                .try_send(ModelEvent::Deadline(deadline::Deadline::Output));
+            return false;
+        }
+        while let Some((event, size)) = self.pending.pop_front() {
+            match self.job.events.try_send(event) {
+                Ok(()) => {
+                    self.bytes -= size;
+                    self.progress = Instant::now();
+                }
+                Err(mpsc::error::TrySendError::Full(event)) => {
+                    self.pending.push_front((event, size));
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.pending.clear();
+                    self.bytes = 0;
+                    return false;
+                }
+            }
+        }
+        !self.job.events.is_closed()
+    }
+    fn send(&mut self, event: ModelEvent) -> bool {
+        if self.failed || !self.flush() {
+            return false;
+        }
+        let size = match &event {
+            ModelEvent::Chunk(v) | ModelEvent::Complete(v) => v.to_string().len(),
+            ModelEvent::Failed(s) | ModelEvent::Unavailable(s) => s.len(),
+            ModelEvent::Deadline(deadline) => deadline.message().len(),
+        };
+        let ceiling = match &event {
+            ModelEvent::Complete(_) if self.job.prepared.sampling.top_logprobs.is_some() => self
+                .job
+                .prepared
+                .max_tokens
+                .saturating_mul(self.job.prepared.sampling.top_logprobs.unwrap() + 1)
+                .saturating_mul(1024)
+                .saturating_add(512 * 1024),
+            _ => 512 * 1024,
+        };
+        if self.bytes.saturating_add(size) > ceiling || self.pending.len() >= 1024 {
+            self.pending.clear();
+            self.bytes = 0;
+            self.failed = true;
+            self.pending
+                .push_back((ModelEvent::Failed("Client output buffer is full".into()), 0));
+            return false;
+        }
+        if self.pending.is_empty() {
+            self.progress = Instant::now();
+        }
+        self.pending.push_back((event, size));
+        self.bytes += size;
+        self.flush()
+    }
+    fn delta(&mut self, model: &str, delta: Value) -> bool {
+        self.delta_scored(model, delta, None)
+    }
+    fn delta_scored(&mut self, model: &str, delta: Value, logprobs: Option<Value>) -> bool {
+        if !self.job.prepared.stream {
+            return !self.job.events.is_closed();
+        }
+        let mut payload = chunk(&self.job, model, delta, None);
+        if let Some(logprobs) = logprobs {
+            payload["choices"][0]["logprobs"] = logprobs;
+        }
+        self.send(ModelEvent::Chunk(payload))
+    }
+}
+enum Ending {
+    Eos,
+    Stop,
+    Cancelled,
+    Failed(String),
+}
+impl Ending {
+    fn cacheable(&self) -> bool {
+        matches!(self, Self::Eos | Self::Stop)
+    }
+}
+struct Active<'a> {
+    retain_image_memory: bool,
+    request: RequestState,
+    output: Response<'a>,
+}
+struct Response<'a> {
+    pending: Option<pipeline::Tokens>,
+    mailbox: Mailbox,
+    parser: output::Output,
+    decoder: Decoder<'a>,
+    count: usize,
+    ending: Option<Ending>,
+    started: Instant,
+    queue_s: f64,
+    first_token_s: Option<f64>,
+    last_token_s: Option<f64>,
+    reasoning_tokens: usize,
+    raw_bytes: usize,
+    pending_scores: VecDeque<(std::ops::Range<usize>, Value)>,
+    content_scores: Vec<Value>,
+}
+impl<'a> Active<'a> {
+    fn new(request: RequestState, job: Job, codec: &'a ChatCodec, has_images: bool) -> Self {
+        Self {
+            retain_image_memory: has_images,
+            request,
+            output: Response::new(job, codec),
+        }
+    }
+    fn finished(&self) -> bool {
+        self.request.is_finished() || self.output.ending.is_some()
+    }
+}
+impl<'a> Response<'a> {
+    fn new(job: Job, codec: &'a ChatCodec) -> Self {
+        let mut parser = output::Output::new(
+            job.prepared.thinking,
+            job.prepared.tools.clone(),
+            job.prepared.stops.clone(),
+            &job.id,
+        );
+        parser.tool_format(job.prepared.tool_format);
+        parser.structured_json(job.prepared.structured);
+        parser.constrained_tools(job.prepared.constrained_tools);
+        if codec.boundary.is_some() {
+            parser.token_boundaries();
+        }
+        let queue_s = job.queued.elapsed().as_secs_f64();
+        Self {
+            pending: None,
+            mailbox: Mailbox::new(job),
+            parser,
+            decoder: codec.tokenizer.decode_stream(false),
+            count: 0,
+            ending: None,
+            started: Instant::now(),
+            queue_s,
+            first_token_s: None,
+            last_token_s: None,
+            reasoning_tokens: 0,
+            raw_bytes: 0,
+            pending_scores: VecDeque::new(),
+            content_scores: vec![],
+        }
+    }
+    fn consume(&mut self, packet: pipeline::Tokens, codec: &ChatCodec, model: &str) {
+        let pipeline::Tokens { tokens, scores } = packet;
+        if !tokens.is_empty() && self.first_token_s.is_none() {
+            self.first_token_s = Some(self.mailbox.job.queued.elapsed().as_secs_f64());
+        }
+        if !tokens.is_empty() {
+            self.last_token_s = Some(self.mailbox.job.queued.elapsed().as_secs_f64());
+        }
+        for (index, &token) in tokens.iter().enumerate() {
+            if self.mailbox.job.events.is_closed() || self.mailbox.failed {
+                self.ending = Some(Ending::Cancelled);
+                break;
+            }
+            self.count += 1;
+            if codec.eos.contains(&token) && !self.mailbox.job.prepared.ignore_eos {
+                self.ending = Some(Ending::Eos);
+                break;
+            }
+            if let Some(score) = scores.get(index) {
+                let bytes = match codec.grammar.token_bytes(token) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        self.ending = Some(Ending::Failed(error));
+                        break;
+                    }
+                };
+                let span = self.raw_bytes..self.raw_bytes + bytes.len();
+                self.raw_bytes = span.end;
+                self.pending_scores
+                    .push_back((span, token_score(codec, score)));
+            }
+            let was_reasoning = self.parser.is_reasoning();
+            let parsed = self
+                .decoder
+                .step(token)
+                .map_err(|e| e.to_string())
+                .and_then(|text| {
+                    self.parser.push_token(
+                        text.as_deref().unwrap_or(""),
+                        codec
+                            .boundary
+                            .as_ref()
+                            .and_then(|b| b.output_control(token)),
+                    )
+                });
+            match parsed {
+                Ok(deltas) => {
+                    if (was_reasoning && codec.tokenizer.token_to_id("</think>") != Some(token))
+                        || deltas.iter().any(|d| d.get("reasoning_content").is_some())
+                    {
+                        self.reasoning_tokens += 1;
+                    }
+                    for delta in deltas {
+                        let logprobs = self.delta_scores(&delta);
+                        if !self.mailbox.delta_scored(model, delta, logprobs) {
+                            self.ending = Some(Ending::Cancelled);
+                            break;
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.ending = Some(Ending::Failed(error));
+                    break;
+                }
+            }
+            while self
+                .pending_scores
+                .front()
+                .is_some_and(|(span, _)| span.end <= self.parser.processed_bytes())
+            {
+                self.pending_scores.pop_front();
+            }
+            if self.ending.is_some() {
+                break;
+            }
+            if self.parser.stopped {
+                self.ending = Some(Ending::Stop);
+                break;
+            }
+        }
+    }
+    fn delta_scores(&mut self, delta: &Value) -> Option<Value> {
+        delta.get("content")?;
+        // Output spans are consumed in content-delta order, including text
+        // withheld across UTF-8, XML markers and stop-string boundaries.
+        let spans = self.parser.take_content_span();
+        let mut content = vec![];
+        if let Some(span) = spans {
+            while self
+                .pending_scores
+                .front()
+                .is_some_and(|(s, _)| s.end <= span.start)
+            {
+                self.pending_scores.pop_front();
+            }
+            while self
+                .pending_scores
+                .front()
+                .is_some_and(|(s, _)| s.start < span.end)
+            {
+                let (range, mut score) = self.pending_scores.pop_front().unwrap();
+                let bytes: Vec<u8> = serde_json::from_value(score["bytes"].clone()).unwrap();
+                let start = span.start.saturating_sub(range.start);
+                let end = (span.end - range.start).min(bytes.len());
+                let visible = &bytes[start..end];
+                let mut fragment = score.clone();
+                fragment["token"] = json!(String::from_utf8_lossy(visible));
+                fragment["bytes"] = json!(visible);
+                content.push(fragment);
+                if range.end > span.end {
+                    score["bytes"] = json!(&bytes[end..]);
+                    self.pending_scores.push_front((span.end..range.end, score));
+                    break;
+                }
+            }
+        }
+        self.mailbox.job.prepared.sampling.top_logprobs?;
+        if !self.mailbox.job.prepared.stream {
+            self.content_scores.extend(content.clone());
+        }
+        Some(json!({"content":content,"refusal":null}))
+    }
+    fn finish(&mut self, request: &RequestState, model: &str) -> Result<()> {
+        debug_assert!(self.pending.is_none());
+        if let Some(error) = request.failure() {
+            return Err(error.into());
+        }
+        match &self.ending {
+            Some(Ending::Cancelled) => return Ok(()),
+            Some(Ending::Failed(error)) => return Err(error.clone()),
+            _ => {}
+        }
+        let exhausted = self.ending.is_none()
+            && self.count == self.mailbox.job.prepared.max_tokens
+            && !request.constraint_finished();
+        for delta in self.parser.finish(
+            exhausted,
+            &self.mailbox.job.prepared.tool_choice,
+            self.mailbox.job.prepared.parallel,
+        )? {
+            let logprobs = self.delta_scores(&delta);
+            if !self.mailbox.delta_scored(model, delta, logprobs) {
+                return Ok(());
+            }
+        }
+        let reason = self.parser.finish_reason(exhausted);
+        let job = &self.mailbox.job;
+        let usage = json!({"prompt_tokens":job.prepared.input.len(),"completion_tokens":self.count,
+            "total_tokens":job.prepared.input.len()+self.count,
+            "completion_tokens_details":{"reasoning_tokens":self.reasoning_tokens},
+            "prompt_tokens_details":{"cached_tokens":request.prefix_statistics().cached_tokens}});
+        let logprobs = job
+            .prepared
+            .sampling
+            .top_logprobs
+            .map(|_| json!({"content":self.content_scores,"refusal":null}));
+        let response = if job.prepared.stream {
+            // SSE has already delivered content and scores. Complete is only
+            // its terminal signal; do not retain a second full response.
+            json!({})
+        } else {
+            json!({"id":job.id,"object":"chat.completion","created":job.created,"model":model,
+                "choices":[{"index":0,"message":self.parser.message(),"finish_reason":reason,"logprobs":logprobs}],"usage":usage})
+        };
+        if job.prepared.stream {
+            let ending = chunk(job, model, json!({}), Some(reason));
+            let usage_chunk=job.prepared.include_usage.then(||json!({"id":job.id,"object":"chat.completion.chunk","created":job.created,"model":model,"choices":[],"usage":usage}));
+            self.mailbox.send(ModelEvent::Chunk(ending));
+            if let Some(usage) = usage_chunk {
+                self.mailbox.send(ModelEvent::Chunk(usage));
+            }
+        }
+        self.mailbox.send(ModelEvent::Complete(response));
+        eprintln!(
+            "{}: {} prompt, {} completion, queue {:.3}s, generation {:.3}s, first_token {:.3}s, {} reasoning, finish {reason}",
+            self.mailbox.job.id,
+            self.mailbox.job.prepared.input.len(),
+            self.count,
+            self.queue_s,
+            self.started.elapsed().as_secs_f64(),
+            self.first_token_s.unwrap_or(0.),
+            self.reasoning_tokens
+        );
+        eprintln!(
+            "{}: prefix {}; MTP {}",
+            self.mailbox.job.id,
+            serde_json::to_string(request.prefix_statistics()).map_err(|e| e.to_string())?,
+            serde_json::to_string(request.speculation_statistics()).map_err(|e| e.to_string())?
+        );
+        Ok(())
+    }
+}
+
+pub(super) fn worker(
+    model: &mut Model,
+    mut jobs: mpsc::Receiver<Job>,
+    codec: &ChatCodec,
+    model_id: &str,
+    shutdown: &AtomicBool,
+    options: scheduler::Options,
+    activity: &Activity,
+) {
+    let lifecycle = &activity.lifecycle;
+    let mut waiting: Vec<Job> = vec![];
+    let mut active: Vec<Active<'_>> = vec![];
+    let mut completed: Vec<Mailbox> = vec![];
+    let mut memory_guard: Option<String> = None;
+    let latency = options.policy == scheduler::Policy::Latency;
+    let mut output_lengths = scheduler::OutputLengths::default();
+    let defer_output = std::env::var("THORUSTINFER_ASYNC_OUTPUT").as_deref() != Ok("0");
+    let mut output_pipeline = pipeline::Statistics::default();
+    loop {
+        if shutdown.load(Ordering::Relaxed) || !lifecycle.is_ready() {
+            break;
+        }
+        completed.retain_mut(|box_| box_.flush() && !box_.pending.is_empty());
+        receive_waiting(&mut waiting, &mut jobs);
+        let barrier = !waiting.is_empty()
+            || active.iter().any(|a| {
+                a.finished()
+                    || a.request.has_pending_host_images()
+                    || (a.request.is_prefilling()
+                        && !a.output.mailbox.job.prepared.audios.is_empty())
+            });
+        for a in &mut active {
+            if !a.output.mailbox.flush()
+                || a.output.mailbox.failed
+                || shutdown.load(Ordering::Relaxed)
+            {
+                a.output.ending = Some(Ending::Cancelled);
+            }
+            // Admission can restore a long prefix or prepare an encoder. Do
+            // not hold a completed response behind that work. Pending state
+            // belongs to this request, never to an index in the active vector.
+            if barrier || a.finished() {
+                a.output.drain(false, codec, model_id, &mut output_pipeline);
+            }
+        }
+        let mut index = 0;
+        while index < active.len() {
+            if active[index].finished() {
+                let mut a = active.remove(index);
+                if !latency && a.output.ending.as_ref().is_some_and(Ending::cacheable) {
+                    output_lengths
+                        .observe(a.output.mailbox.job.prepared.input.len(), a.output.count);
+                }
+                let cache = a.output.ending.as_ref().is_none_or(Ending::cacheable)
+                    && a.output.count == a.request.generated_tokens()
+                    && a.request.failure().is_none();
+                if lifecycle.is_ready()
+                    && let Err(error) = model.finish_request(&mut a.request, cache)
+                {
+                    let failure =
+                        thorustinfer_engine::error::EngineError::take(error.clone(), true);
+                    lifecycle.fail(failure);
+                    a.output.ending = Some(Ending::Failed(error));
+                }
+                if let Err(error) = a.output.finish(&a.request, model_id) {
+                    a.output.mailbox.send(ModelEvent::Failed(error));
+                } else if !matches!(a.output.ending, Some(Ending::Cancelled | Ending::Failed(_)))
+                    && let Some(first_s) = a.output.first_token_s
+                    && let Ok(mut measurements) = activity.measurements.lock()
+                {
+                    measurements.observe(
+                        super::metrics::Completed {
+                            queue_s: a.output.queue_s,
+                            first_s,
+                            last_s: a.output.last_token_s.unwrap_or(first_s),
+                            complete_s: a.output.mailbox.job.queued.elapsed().as_secs_f64(),
+                            prompt_tokens: a.output.mailbox.job.prepared.input.len(),
+                            output_tokens: a.output.count,
+                        },
+                        a.request.prefix_statistics(),
+                    );
+                }
+                completed.push(a.output.mailbox);
+            } else {
+                index += 1;
+            }
+        }
+        if shutdown.load(Ordering::Relaxed) || !lifecycle.is_ready() {
+            break;
+        }
+        let admission = Instant::now();
+        let has_decoders = active.iter().any(|a| !a.request.is_prefilling());
+        if memory_guard
+            .as_ref()
+            .is_some_and(|id| !waiting.iter().any(|job| &job.id == id))
+        {
+            memory_guard = None;
+        }
+        let mut prefix_waits = 0;
+        let mut deadline_yields = 0;
+        let mut admitted_count = 0;
+        let mut cached_count = 0;
+        let mut cold_deferrals = 0;
+        let cold_prompt_capacity = if latency {
+            model.latency_prefill_capacity()
+        } else {
+            model.prefill_packet_capacity()
+        };
+        while lifecycle.is_ready() && active.len() < options.max_active && !waiting.is_empty() {
+            let pending_prefill: usize = active
+                .iter()
+                .filter(|a| a.request.is_prefilling())
+                .map(|a| a.request.remaining_prefill_tokens())
+                .sum();
+            let slack = active
+                .iter()
+                .filter_map(|a| a.request.decode_slack_s(options.target_tpot_ms))
+                .fold(f64::INFINITY, f64::min);
+            if latency
+                && has_decoders
+                && (slack <= 0.
+                    || admission.elapsed().as_secs_f64()
+                        >= (options.target_tpot_ms / 1000. * 0.25).min(0.1))
+            {
+                deadline_yields += 1;
+                break;
+            }
+            let costs: Vec<_> = waiting
+                .iter_mut()
+                .map(|job| {
+                    if job.hint.is_none() {
+                        job.hint = model
+                            .request_hint(
+                                &job.prepared.input,
+                                &job.prepared.images,
+                                &job.prepared.audios,
+                            )
+                            .ok();
+                    }
+                    let mut cost = job
+                        .hint
+                        .as_ref()
+                        .and_then(|hint| model.estimated_hint_cost(hint).ok())
+                        .unwrap_or(scheduler::Waiting {
+                            age_s: 0.,
+                            remaining_s: f64::MAX,
+                            restore_s: 0.,
+                            startup_s: 0.,
+                            remaining_tokens: 0,
+                        });
+                    cost.age_s = job.queued.elapsed().as_secs_f64();
+                    cost
+                })
+                .collect();
+            let mut admitted = false;
+            let mut cached_text = false;
+            let mut deferred_images = 0;
+            let mut untried: Vec<_> = if latency {
+                (0..waiting.len()).collect()
+            } else {
+                let mut remaining: Vec<_> = active
+                    .iter()
+                    .map(|a| {
+                        (output_lengths.estimate(
+                            a.output.mailbox.job.prepared.input.len(),
+                            a.output.mailbox.job.prepared.max_tokens,
+                        ) - a.output.count as f64)
+                            .max(1.)
+                    })
+                    .collect();
+                remaining.sort_unstable_by(f64::total_cmp);
+                let cohort = remaining.get(remaining.len() / 2).copied();
+                let expected: Vec<_> = waiting
+                    .iter()
+                    .map(|job| {
+                        output_lengths.estimate(job.prepared.input.len(), job.prepared.max_tokens)
+                    })
+                    .collect();
+                // Pop the highest priority candidate without rescanning and
+                // allocating a new cost vector for every rejected admission.
+                let mut order = scheduler::rank_throughput_waiting(&costs, &expected, cohort);
+                order.reverse();
+                order
+            };
+            untried.retain(|&i| memory_guard.as_ref().is_none_or(|id| id == &waiting[i].id));
+            while !untried.is_empty() {
+                let i = if latency {
+                    let relative = scheduler::select_waiting(
+                        &untried.iter().map(|&i| costs[i]).collect::<Vec<_>>(),
+                    )
+                    .expect("nonempty candidates");
+                    untried.remove(relative)
+                } else {
+                    untried.pop().expect("nonempty candidates")
+                };
+                // Keep cold residency aligned with one executable packet.
+                // Later requests stay in the CPU queue while this packet is
+                // prepared, rather than paying allocation/media startup first.
+                // Cached requests can still join the active decode cohort.
+                if !latency
+                    && costs[i].remaining_tokens > 0
+                    && pending_prefill >= cold_prompt_capacity
+                {
+                    cold_deferrals += 1;
+                    continue;
+                }
+                if costs[i].age_s < 30. && costs[i].remaining_tokens > 0 {
+                    // Large cold prompts need bounded residency. Small prompts
+                    // must still form a cohort to amortize a model weight pass.
+                    if latency
+                        && costs[i].remaining_tokens > cold_prompt_capacity
+                        && active
+                            .iter()
+                            .filter(|a| a.request.is_prefilling())
+                            .filter(|a| a.request.remaining_prefill_tokens() > cold_prompt_capacity)
+                            .count()
+                            >= 2
+                    {
+                        cold_deferrals += 1;
+                        continue;
+                    }
+                    if model.prefix_cache_enabled()
+                        && let Some(hint) = &waiting[i].hint
+                    {
+                        let mut shared = false;
+                        for a in &mut active {
+                            if model
+                                .share_prefill_checkpoint(&mut a.request, hint)
+                                .unwrap_or(false)
+                            {
+                                shared = true;
+                                break;
+                            }
+                        }
+                        if shared {
+                            prefix_waits += 1;
+                            continue;
+                        }
+                    }
+                }
+                if latency && has_decoders && costs[i].age_s < 30. {
+                    if costs[i].startup_s + costs[i].restore_s > slack {
+                        deadline_yields += 1;
+                        continue;
+                    }
+                    if !model.decode_admission_allowed(
+                        &active.iter().map(|a| &a.request).collect::<Vec<_>>(),
+                        waiting[i].prepared.input.len(),
+                        &options,
+                    ) {
+                        cold_deferrals += 1;
+                        continue;
+                    }
+                }
+                let job = &waiting[i];
+                let mut input = GenerationInput {
+                    input_tokens: job.prepared.input.clone(),
+                    images: job.prepared.images.clone(),
+                    audios: job.prepared.audios.clone(),
+                    max_new_tokens: job.prepared.max_tokens,
+                    sampling: job.prepared.sampling.clone(),
+                    prefix_hints: job.prepared.prefix_hints.clone(),
+                };
+                match model.can_admit(&input, &options) {
+                    Ok(true) => {
+                        let mut job = waiting.remove(i);
+                        if memory_guard.as_ref() == Some(&job.id) {
+                            memory_guard = None;
+                        }
+                        // Admission probes may inspect a copy, then transfer the original
+                        // pixels to encoding. The queued job need not retain another bank.
+                        input.images = std::mem::take(&mut job.prepared.images);
+                        let has_images = !input.images.is_empty();
+                        let text_only = input.images.is_empty() && input.audios.is_empty();
+                        let prompt_tokens = input.input_tokens.len();
+                        match model.start_request(input, || {
+                            job.events.is_closed() || shutdown.load(Ordering::Relaxed)
+                        }) {
+                            Ok(mut request) => {
+                                deferred_images = if has_images {
+                                    model.deferred_image_capacity(&costs[i])
+                                } else {
+                                    0
+                                };
+                                if has_images
+                                    && !request.has_pending_host_images()
+                                    && let Some(memory) = &job._memory
+                                {
+                                    memory.release_images();
+                                }
+                                if let Some(shared) = job.shared_prefix {
+                                    request.retain_shared_prefixes_only(shared >= prompt_tokens);
+                                }
+                                if let Some(constraint) = job.prepared.constraint.take() {
+                                    request
+                                        .set_constraint(constraint)
+                                        .expect("Request has not generated tokens");
+                                }
+                                cached_text = text_only
+                                    && request.prefix_statistics().cached_tokens == prompt_tokens;
+                                let mut a = Active::new(request, job, codec, has_images);
+                                a.output
+                                    .mailbox
+                                    .delta(model_id, json!({"role":"assistant","content":""}));
+                                active.push(a);
+                            }
+                            Err(error) => {
+                                let failure = thorustinfer_engine::error::EngineError::take(
+                                    error.clone(),
+                                    false,
+                                );
+                                let unavailable = failure.is_fatal()
+                                    || failure.kind
+                                        == thorustinfer_engine::error::ErrorKind::Capacity;
+                                if failure.is_fatal() {
+                                    lifecycle.fail(failure);
+                                }
+                                let mut mailbox = Mailbox::new(job);
+                                mailbox.send(if unavailable {
+                                    ModelEvent::Unavailable(error)
+                                } else {
+                                    ModelEvent::Failed(error)
+                                });
+                                completed.push(mailbox);
+                            }
+                        }
+                        admitted = true;
+                        break;
+                    }
+                    Err(error) => {
+                        let failure =
+                            thorustinfer_engine::error::EngineError::take(error.clone(), false);
+                        let unavailable = failure.is_fatal()
+                            || failure.kind == thorustinfer_engine::error::ErrorKind::Capacity;
+                        if failure.is_fatal() {
+                            lifecycle.fail(failure);
+                        }
+                        let job = waiting.remove(i);
+                        let mut mailbox = Mailbox::new(job);
+                        mailbox.send(if unavailable {
+                            ModelEvent::Unavailable(error)
+                        } else {
+                            ModelEvent::Failed(error)
+                        });
+                        completed.push(mailbox);
+                        admitted = true;
+                        break;
+                    }
+                    Ok(false) => {
+                        if costs[i].age_s >= 30. {
+                            memory_guard = Some(waiting[i].id.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+            if admitted {
+                admitted_count += 1;
+                cached_count += usize::from(cached_text);
+                // HTTP arrivals continue while CUDA restores a prefix. Include
+                // already-arrived work in the cohort without a batching timer.
+                if !latency || cached_text || !has_decoders {
+                    receive_waiting(&mut waiting, &mut jobs);
+                }
+            }
+            if !admitted
+                || (deferred_images > 0 && admitted_count >= deferred_images)
+                || (latency
+                    && scheduler::admission_should_yield(
+                        has_decoders,
+                        admitted_count,
+                        admission.elapsed().as_secs_f64(),
+                        // Encoding runs after admission across the rank team.
+                        // A 10 ms host slice otherwise admits just one image
+                        // owner after its arena/prefix setup. The surrounding
+                        // loop still bounds admission by actual decode slack.
+                        cached_text || deferred_images > 0,
+                    ))
+            {
+                break;
+            }
+        }
+        if admitted_count > 0 {
+            let seconds = admission.elapsed().as_secs_f64();
+            if let Ok(mut statistics) = activity.admission.lock() {
+                statistics.rounds += 1;
+                statistics.requests += admitted_count;
+                statistics.cached_text_requests += cached_count;
+                statistics.wall_s += seconds;
+                statistics.max_round_s = statistics.max_round_s.max(seconds);
+                *statistics.histogram.entry(admitted_count).or_default() += 1;
+            }
+        }
+        if cold_deferrals > 0
+            && let Ok(mut statistics) = activity.admission.lock()
+        {
+            statistics.cold_deferrals += cold_deferrals;
+        }
+        if let Ok(mut stats) = activity.admission.lock() {
+            stats.prefix_waits += prefix_waits;
+            stats.deadline_yields += deadline_yields;
+            stats.memory_drain_rounds += usize::from(memory_guard.is_some());
+        }
+        activity.active.store(active.len(), Ordering::Relaxed);
+        activity
+            .queued
+            .store(waiting.len() + jobs.len(), Ordering::Relaxed);
+        if !lifecycle.is_ready() {
+            break;
+        }
+        if !active.is_empty() {
+            let (mut requests, mut responses): (Vec<_>, Vec<_>) = active
+                .iter_mut()
+                .map(|a| (&mut a.request, &mut a.output))
+                .unzip();
+            // Engine state is already committed. Only the preceding packet's
+            // response work is delayed; the next forward consumes the exact
+            // accepted token/history and retains the usual device lifetimes.
+            let result = model.advance_requests_with(&mut requests, &options, || {
+                completed.retain_mut(|box_| box_.flush() && !box_.pending.is_empty());
+                receive_waiting(&mut waiting, &mut jobs);
+                for response in &mut responses {
+                    response.drain(true, codec, model_id, &mut output_pipeline);
+                    response.mailbox.flush();
+                }
+            });
+            drop(requests);
+            // Empty/cached packets and failures before submission need not run
+            // maintenance. Drain once here as well, before publishing new data.
+            for response in &mut responses {
+                response.drain(false, codec, model_id, &mut output_pipeline);
+            }
+            drop(responses);
+            match result {
+                Ok(outputs) => {
+                    for a in &mut active {
+                        if a.retain_image_memory && !a.request.has_pending_host_images() {
+                            if let Some(memory) = &a.output.mailbox.job._memory {
+                                memory.release_images();
+                            }
+                            a.retain_image_memory = false;
+                        }
+                    }
+                    for output in outputs {
+                        let a = &mut active[output.request];
+                        let packet = pipeline::Tokens {
+                            tokens: output.tokens,
+                            scores: a.request.take_logprobs(),
+                        };
+                        a.output.deliver(
+                            packet,
+                            defer_output && !a.request.is_finished(),
+                            codec,
+                            model_id,
+                            &mut output_pipeline,
+                        );
+                    }
+                }
+                Err(error) => {
+                    lifecycle.fail(thorustinfer_engine::error::EngineError::take(
+                        error.clone(),
+                        true,
+                    ));
+                    for a in &mut active {
+                        a.output.ending = Some(Ending::Failed(error.clone()));
+                    }
+                }
+            }
+            let after = model.scheduler_statistics();
+            if let Ok(mut statistics) = activity.statistics.lock() {
+                *statistics = after;
+            }
+            if let Ok(mut statistics) = activity.output_pipeline.lock() {
+                *statistics = output_pipeline.clone();
+            }
+        } else if waiting.is_empty() && completed.is_empty() {
+            let Some(job) = jobs.blocking_recv() else {
+                break;
+            };
+            waiting.push(job);
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    jobs.close();
+    for job in waiting
+        .drain(..)
+        .chain(std::iter::from_fn(|| jobs.try_recv().ok()))
+    {
+        let _ = job
+            .events
+            .try_send(ModelEvent::Unavailable("GPU worker stopped".into()));
+    }
+    for mut a in active.drain(..) {
+        // Shutdown discards outstanding presentation work; no pending packet
+        // may keep an owner alive or emit after its terminal error.
+        a.output.pending = None;
+        if lifecycle.name() != "failed"
+            && let Err(error) = model.finish_request(&mut a.request, false)
+        {
+            lifecycle.fail(thorustinfer_engine::error::EngineError::take(error, true));
+        }
+        let _ = a
+            .output
+            .mailbox
+            .job
+            .events
+            .try_send(ModelEvent::Unavailable("GPU worker stopped".into()));
+    }
+    for mailbox in &mut completed {
+        mailbox.flush();
+    }
+    activity.active.store(0, Ordering::Relaxed);
+    activity.queued.store(0, Ordering::Relaxed);
+    if let Ok(stats) = serde_json::to_string(&model.scheduler_statistics()) {
+        eprintln!("SCHEDULER {stats}");
+    }
+    if let Ok(stats) = serde_json::to_string(&output_pipeline) {
+        eprintln!("OUTPUT_PIPELINE {stats}");
+    }
+}
+
+fn receive_waiting(waiting: &mut Vec<Job>, jobs: &mut mpsc::Receiver<Job>) {
+    while waiting.len() < 128 {
+        match jobs.try_recv() {
+            Ok(job) => waiting.push(job),
+            Err(_) => break,
+        }
+    }
+    waiting.retain(|job| {
+        if job.limits.queue_ms != 0
+            && job.queued.elapsed().as_millis() >= job.limits.queue_ms as u128
+        {
+            let _ = job
+                .events
+                .try_send(ModelEvent::Deadline(deadline::Deadline::Queue));
+            return false;
+        }
+        !job.events.is_closed()
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    pub(super) fn mailbox() -> (Mailbox, mpsc::Receiver<ModelEvent>) {
+        let (events, receiver) = mpsc::channel(1);
+        let job = Job {
+            _slot: Arc::new(
+                Arc::new(tokio::sync::Semaphore::new(1))
+                    .try_acquire_owned()
+                    .unwrap(),
+            ),
+            _memory: None,
+            limits: Limits::default(),
+            prepared: Prepared {
+                tool_format: output::ToolFormat::Qwen,
+                audios: vec![],
+                input: vec![1],
+                images: vec![],
+                max_tokens: 16,
+                ignore_eos: false,
+                sampling: Default::default(),
+                tools: vec![],
+                tool_choice: json!("auto"),
+                parallel: false,
+                stops: vec![],
+                thinking: false,
+                structured: false,
+                constrained_tools: false,
+                stream: true,
+                include_usage: false,
+                constraint: None,
+                prefix_hints: vec![],
+            },
+            events,
+            id: "test".into(),
+            created: 0,
+            queued: Instant::now(),
+            hint: None,
+            shared_prefix: None,
+        };
+        (Mailbox::new(job), receiver)
+    }
+
+    #[test]
+    fn complete_responses_skip_stream_chunks_but_keep_disconnect_detection() {
+        let (mut mailbox, receiver) = mailbox();
+        mailbox.job.prepared.stream = false;
+        for _ in 0..100 {
+            assert!(mailbox.delta("test", json!({"content":"译文"})));
+        }
+        assert!(mailbox.pending.is_empty());
+        assert!(receiver.is_empty());
+        drop(receiver);
+        assert!(!mailbox.delta("test", json!({"content":"译文"})));
+    }
+    #[test]
+    fn long_prefill_does_not_start_the_slow_reader_deadline_early() {
+        let (mut mailbox, _receiver) = mailbox();
+        mailbox.progress = Instant::now() - std::time::Duration::from_secs(120);
+        assert!(mailbox.send(ModelEvent::Chunk(json!(1))));
+        assert!(!mailbox.failed);
+        assert!(mailbox.send(ModelEvent::Chunk(json!(2))));
+        mailbox.progress = Instant::now() - std::time::Duration::from_secs(120);
+        assert!(!mailbox.flush());
+        assert!(mailbox.failed);
+    }
+    #[test]
+    fn admission_collects_arrivals_and_discards_disconnected_waiters() {
+        let (sender, mut jobs) = mpsc::channel(4);
+        let (first, first_receiver) = mailbox();
+        let (cancelled, cancelled_receiver) = mailbox();
+        sender.try_send(first.job).unwrap();
+        sender.try_send(cancelled.job).unwrap();
+        drop(cancelled_receiver);
+        let mut waiting = Vec::new();
+        receive_waiting(&mut waiting, &mut jobs);
+        assert_eq!(waiting.len(), 1);
+        let (arrival, arrival_receiver) = mailbox();
+        sender.try_send(arrival.job).unwrap();
+        receive_waiting(&mut waiting, &mut jobs);
+        assert_eq!(waiting.len(), 2);
+        drop((first_receiver, arrival_receiver));
+        receive_waiting(&mut waiting, &mut jobs);
+        assert!(waiting.is_empty());
+    }
+
+    #[test]
+    fn queue_deadline_releases_the_waiter_and_keeps_later_requests_usable() {
+        let (sender, mut jobs) = mpsc::channel(4);
+        let (mut expired, mut expired_receiver) = mailbox();
+        expired.job.limits.queue_ms = 1;
+        expired.job.queued = Instant::now() - std::time::Duration::from_secs(1);
+        sender.try_send(expired.job).unwrap();
+        let (live, mut live_receiver) = mailbox();
+        sender.try_send(live.job).unwrap();
+        let mut waiting = Vec::new();
+        receive_waiting(&mut waiting, &mut jobs);
+        assert_eq!(waiting.len(), 1);
+        assert!(matches!(
+            expired_receiver.try_recv().unwrap(),
+            ModelEvent::Deadline(deadline::Deadline::Queue)
+        ));
+        assert!(expired_receiver.is_closed());
+        assert!(live_receiver.try_recv().is_err());
+        waiting[0]
+            .events
+            .try_send(ModelEvent::Chunk(json!(1)))
+            .unwrap();
+        assert!(matches!(
+            live_receiver.try_recv().unwrap(),
+            ModelEvent::Chunk(_)
+        ));
+    }
+
+    #[test]
+    fn full_transport_retains_event_order_without_blocking_worker() {
+        let (mut mailbox, mut receiver) = mailbox();
+        for id in 0..3 {
+            assert!(mailbox.send(ModelEvent::Chunk(json!(id))));
+        }
+        assert_eq!(mailbox.pending.len(), 2);
+        for id in 0..3 {
+            assert!(matches!(receiver.try_recv().unwrap(), ModelEvent::Chunk(v) if v == json!(id)));
+            assert!(mailbox.flush());
+        }
+        assert!(mailbox.pending.is_empty());
+        assert_eq!(mailbox.bytes, 0);
+    }
+
+    #[test]
+    fn slow_or_disconnected_client_has_bounded_retained_output() {
+        let (mut mailbox, receiver) = mailbox();
+        assert!(mailbox.send(ModelEvent::Chunk(json!(0))));
+        assert!(!mailbox.send(ModelEvent::Chunk(json!("x".repeat(512 * 1024)))));
+        assert!(mailbox.failed);
+        assert_eq!(mailbox.pending.len(), 1);
+        assert!(!mailbox.send(ModelEvent::Complete(json!({}))));
+        drop(receiver);
+        assert!(!mailbox.flush());
+        assert!(mailbox.pending.is_empty());
+    }
+    #[test]
+    fn large_probability_completion_uses_reserved_budget_without_unbounding_chunks() {
+        let (mut mailbox, _receiver) = mailbox();
+        mailbox.job.prepared.sampling.top_logprobs = Some(20);
+        mailbox.job.prepared.max_tokens = 1024;
+        assert!(mailbox.send(ModelEvent::Chunk(json!(0))));
+        assert!(mailbox.send(ModelEvent::Complete(json!("x".repeat(640 * 1024)))));
+        assert_eq!(mailbox.pending.len(), 1);
+        assert!(!mailbox.failed);
+        let (mut mailbox, _receiver) = self::mailbox();
+        mailbox.job.prepared.sampling.top_logprobs = Some(20);
+        assert!(mailbox.send(ModelEvent::Chunk(json!(0))));
+        assert!(!mailbox.send(ModelEvent::Chunk(json!("x".repeat(640 * 1024)))));
+    }
+}

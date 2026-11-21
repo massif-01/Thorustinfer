@@ -1,0 +1,153 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "thorustinfer/qwen3.8-27b",
+  "small_model": "thorustinfer/qwen3.8-27b",
+  "provider": {
+    "thorustinfer": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "thorustinfer local",
+      "options": {
+        "baseURL": "http://127.0.0.1:8088/v1"
+      },
+      "models": {
+        "qwen3.8-27b": {
+          "name": "Qwen3.8 27B on thorustinfer",
+          "attachment": true,
+          "reasoning": true,
+          "tool_call": true,
+          "interleaved": {
+            "field": "reasoning_content"
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 262144,
+            "output": 8192
+          },
+          "options": {
+            "temperature": 0,
+            "reasoningEffort": "none",
+            "thinking_token_budget": 1024
+          },
+          "variants": {
+            "off": {
+              "reasoningEffort": "none"
+            },
+            "low": {
+              "reasoningEffort": "low",
+              "thinking_token_budget": 512
+            },
+            "medium": {
+              "reasoningEffort": "medium",
+              "thinking_token_budget": 1024
+            },
+            "high": {
+              "reasoningEffort": "high",
+              "thinking_token_budget": 2048
+            }
+          }
+        },
+        "qwen-flash-next": {
+          "name": "Qwen3.8 Flash Next on thorustinfer",
+          "attachment": true,
+          "reasoning": true,
+          "tool_call": true,
+          "interleaved": {
+            "field": "reasoning_content"
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 262144,
+            "output": 8192
+          },
+          "options": {
+            "temperature": 0,
+            "reasoningEffort": "none",
+            "thinking_token_budget": 1024
+          },
+          "variants": {
+            "off": {
+              "reasoningEffort": "none"
+            },
+            "low": {
+              "reasoningEffort": "low",
+              "thinking_token_budget": 512
+            },
+            "medium": {
+              "reasoningEffort": "medium",
+              "thinking_token_budget": 1024
+            },
+            "high": {
+              "reasoningEffort": "high",
+              "thinking_token_budget": 2048
+            }
+          }
+        },
+        "deepseek-v4.1": {
+          "name": "DeepSeek V4.1 on thorustinfer",
+          "attachment": true,
+          "reasoning": true,
+          "tool_call": true,
+          "interleaved": {
+            "field": "reasoning_content"
+          },
+          "modalities": {
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": 262144,
+            "output": 8192
+          },
+          "options": {
+            "temperature": 0,
+            "enable_thinking": true,
+            "reasoningEffort": "high"
+          },
+          "variants": {
+            "off": {
+              "enable_thinking": false,
+              "reasoningEffort": "none"
+            },
+            "low": {
+              "enable_thinking": true,
+              "reasoningEffort": "low"
+            },
+            "high": {
+              "enable_thinking": true,
+              "reasoningEffort": "high"
+            },
+            "max": {
+              "enable_thinking": true,
+              "reasoningEffort": "max"
+            }
+          }
+        }
+      }
+    }
+  },
+  "compaction": {
+    "auto": true
+  },
+  "share": "disabled"
+}

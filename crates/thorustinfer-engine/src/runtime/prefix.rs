@@ -1,0 +1,708 @@
+use super::*;
+use crate::backend::snapshot::Range;
+use crate::prefix::{Admission, Entry, Media, hash_floats};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Default)]
+pub(super) struct Context {
+    parent: Option<(bool, u64)>,
+    private_checkpoint_bytes: usize,
+    pub statistics: crate::prefix::Statistics,
+}
+
+impl Context {
+    pub(super) fn device_parent(&self) -> Option<u64> {
+        self.parent.and_then(|(host, id)| (!host).then_some(id))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Checkpoint {
+    Reusable,
+    Intermediate,
+    Decoded,
+}
+
+impl Checkpoint {
+    pub(super) fn prefill(position: usize, end: usize, matched: usize) -> Self {
+        if position == matched || end - position <= 8 {
+            Self::Reusable
+        } else {
+            Self::Intermediate
+        }
+    }
+
+    fn allows_eviction(self, adjacent: bool) -> bool {
+        self == Self::Reusable && !adjacent
+    }
+
+    fn admits_device(self, admission: &Admission, adjacent: bool, headroom: bool) -> bool {
+        match admission {
+            Admission::Ready => headroom || self.allows_eviction(adjacent),
+            Admission::Reclaim => self.allows_eviction(adjacent),
+            Admission::TooLarge => false,
+        }
+    }
+}
+
+fn checkpoint_headroom(private_bytes: usize, projected_bytes: usize, budget: usize) -> bool {
+    // Reserve half the cache for reusable endpoints when private state is costly.
+    private_bytes <= budget / 32 || projected_bytes <= budget / 2
+}
+
+impl ModelRuntime {
+    pub(crate) fn prefix_media(
+        &self,
+        input: &[u32],
+        images: &[crate::vision::ImageInput],
+        audios: &[crate::audio::AudioInput],
+    ) -> Result<Media> {
+        let mut media = Media::images(input, images, self.manifest.vision.as_ref())?.0;
+        let mut cursor = 0;
+        for audio in audios {
+            let a = self
+                .manifest
+                .audio
+                .as_ref()
+                .ok_or("Model has no audio adapter")?;
+            let features = audio.features()?;
+            let start = input
+                .iter()
+                .skip(cursor)
+                .position(|&t| t == a.token_id)
+                .map(|i| i + cursor)
+                .ok_or("Missing audio marker")?;
+            let mut hash = Sha256::new();
+            hash.update((audio.frames as u64).to_le_bytes());
+            hash_floats(&mut hash, &audio.mel);
+            media.push((start, hash.finalize().into()));
+            cursor = start
+                .checked_add(features)
+                .filter(|&n| n <= input.len())
+                .ok_or("Audio span outside prompt")?;
+        }
+        media.sort_by_key(|item| item.0);
+        Ok(Media(media))
+    }
+    pub(crate) fn prefix_match_tokens(
+        &self,
+        input: &[u32],
+        images: &[crate::vision::ImageInput],
+    ) -> Result<usize> {
+        self.prefix_match_cost(input, images)
+            .map(|(tokens, _)| tokens)
+    }
+    pub(crate) fn prefix_match_cost(
+        &self,
+        input: &[u32],
+        images: &[crate::vision::ImageInput],
+    ) -> Result<(usize, usize)> {
+        if !self.prefix_enabled() {
+            return Ok((0, 0));
+        }
+        let media = self.prefix_media(input, images, &[])?;
+        Ok(self.prefix_match_media(input, &media))
+    }
+    pub(super) fn prefix_match_media(&self, input: &[u32], media: &Media) -> (usize, usize) {
+        if !self.prefix_enabled() {
+            return (0, 0);
+        }
+        self.prefix_hit(input, media)
+            .map(|(host, id)| {
+                if host {
+                    let e = &self.prefix_cache.host.entries[&id];
+                    (e.tokens.len(), e.bytes)
+                } else {
+                    let e = &self.prefix_cache.device.entries[&id];
+                    (e.tokens.len(), e.bytes)
+                }
+            })
+            .unwrap_or((0, 0))
+    }
+    pub(crate) fn prefix_enabled(&self) -> bool {
+        self.prefix_cache.enabled()
+    }
+    fn prefix_hit(&self, input: &[u32], media: &Media) -> Option<(bool, u64)> {
+        self.prefix_cache.matched(
+            input,
+            media,
+            |e| {
+                self.prefill_costs
+                    .score(e.tokens.len(), input.len(), e.bytes)
+            },
+            |e| {
+                self.prefill_costs
+                    .score(e.tokens.len(), input.len(), e.bytes)
+            },
+        )
+    }
+    pub(super) fn restore_prefix(
+        &mut self,
+        input: &[u32],
+        media: &Media,
+        context: &mut Context,
+    ) -> Result<(usize, super::speculation::PrefillWarm)> {
+        context.statistics = crate::prefix::Statistics::default();
+        context.parent = None;
+        self.execution.collect_snapshots()?;
+        let at = Instant::now();
+        let hit = self.prefix_hit(input, media);
+        let device_match = self
+            .prefix_cache
+            .device
+            .match_prefix_by(input, media, |_| None)
+            .matched_tokens;
+        let host_match = self
+            .prefix_cache
+            .host
+            .match_prefix_by(input, media, |_| None)
+            .matched_tokens;
+        context.statistics.matched_tokens = device_match.max(host_match);
+        context.statistics.lookup_s = at.elapsed().as_secs_f64();
+        let Some((host, id)) = hit else {
+            return Ok((0, super::speculation::PrefillWarm::default()));
+        };
+        let at = Instant::now();
+        let (tokens, warm, bytes) = if host {
+            let e = self.prefix_cache.host.touch(id);
+            self.execution.restore_host_snapshot(&e.snapshot)?;
+            context.statistics.host_hits += 1;
+            (e.tokens.len(), e.warm_tokens, e.bytes)
+        } else {
+            let e = self.prefix_cache.device.touch(id);
+            self.execution.restore_snapshot(&e.snapshot)?;
+            (e.tokens.len(), e.warm_tokens, e.bytes)
+        };
+        context.parent = Some((host, id));
+        context.statistics.cached_tokens = tokens;
+        context.statistics.restore_s = at.elapsed().as_secs_f64();
+        self.prefill_costs
+            .observe_restore(bytes, context.statistics.restore_s);
+        Ok((
+            tokens,
+            super::speculation::PrefillWarm {
+                tokens: warm,
+                seconds: 0.0,
+            },
+        ))
+    }
+    pub(super) fn admit_prefix_checkpoint(
+        &self,
+        prefix: usize,
+        end: usize,
+        start: usize,
+        checkpoints: &BTreeSet<usize>,
+        reused: bool,
+    ) -> Result<bool> {
+        let bytes = self.prefix_ranges(prefix)?.values().map(|r| r.bytes).sum();
+        Ok(bytes
+            <= self
+                .prefix_cache
+                .device
+                .budget
+                .max(self.prefix_cache.host.budget)
+            && self
+                .prefill_costs
+                .admit_with_reuse(prefix, end, bytes, start, checkpoints, reused))
+    }
+    pub(super) fn prefix_ranges(&self, tokens: usize) -> Result<BTreeMap<String, Range>> {
+        let m = &self.manifest;
+        let mut names: BTreeSet<String> = m.reset_buffers.iter().cloned().collect();
+        names.extend([
+            m.position.clone(),
+            m.token.clone(),
+            m.status.clone(),
+            m.logits.clone(),
+        ]);
+        let mut mtp_kv = BTreeSet::new();
+        if let Some(kv) = &m.kv_cache {
+            for g in kv.growth.values().filter(|g| g.position != m.position) {
+                mtp_kv.extend(g.buffers.iter().cloned());
+            }
+        }
+        if let Some(spec) = &m.mtp {
+            names.extend([spec.position.clone(), spec.target_length.clone()]);
+            if let Some(ring) = &spec.hidden_ring {
+                names.insert(ring.clone());
+            }
+            if let Some(kv) = &m.kv_cache {
+                for growth in kv.growth.values().filter(|g| g.position == spec.position) {
+                    mtp_kv.extend(growth.buffers.iter().cloned());
+                }
+            }
+        }
+        let mut ranges = BTreeMap::new();
+        for name in names {
+            if m.mtp.is_none() && mtp_kv.contains(&name) {
+                continue;
+            }
+            let b = m
+                .buffers
+                .iter()
+                .find(|b| b.name == name)
+                .ok_or("Missing prefix state buffer")?;
+            let range = if let Some(stride) = m.kv_cache.as_ref().and_then(|k| k.buffers.get(&name))
+            {
+                let count = if mtp_kv.contains(&name) {
+                    tokens - 1
+                } else {
+                    tokens
+                };
+                let divisor = m
+                    .kv_cache
+                    .as_ref()
+                    .and_then(|k| k.prefix_divisors.get(&name))
+                    .copied()
+                    .unwrap_or(1);
+                Range {
+                    offset: 0,
+                    bytes: (count / divisor * divisor)
+                        .checked_mul(*stride)
+                        .ok_or("Prefix KV extent overflow")?,
+                }
+            } else if m.mtp.as_ref().and_then(|s| s.hidden_ring.as_ref()) == Some(&name) {
+                // A warmed checkpoint only needs h[P-1] for the next bridge.
+                let rows = b.shape[0];
+                let row = b.bytes()? / rows;
+                Range {
+                    offset: (tokens - 1) % rows * row,
+                    bytes: row,
+                }
+            } else {
+                Range {
+                    offset: 0,
+                    bytes: b.bytes()?,
+                }
+            };
+            ranges.insert(name, range);
+        }
+        Ok(ranges)
+    }
+    pub(super) fn should_store_decoded_prefix(&self, context: &Context) -> bool {
+        let device = &self.prefix_cache.device;
+        let projected = device
+            .bytes
+            .saturating_add(context.private_checkpoint_bytes);
+        self.prefix_enabled()
+            && (self.prefix_cache.host.budget != 0
+                || (projected <= device.budget
+                    && checkpoint_headroom(
+                        context.private_checkpoint_bytes,
+                        projected,
+                        device.budget,
+                    )))
+    }
+    pub(super) fn store_prefix(
+        &mut self,
+        input: &[u32],
+        media: &Media,
+        warm_tokens: usize,
+        checkpoint: Checkpoint,
+        context: &mut Context,
+    ) -> Result<()> {
+        let at = Instant::now();
+        let logits_valid = checkpoint != Checkpoint::Decoded;
+        if self.prefix_enabled()
+            && self.manifest.mtp.is_some()
+            && (input.is_empty() || warm_tokens != input.len() - 1)
+        {
+            return Err("Prefix checkpoint must retain exactly P-1 MTP inputs".into());
+        }
+        let same = self.prefix_cache.device.entries.values().any(|e| {
+            e.tokens == input
+                && e.media.common_tokens(media, input.len()) == input.len()
+                && (!logits_valid || e.logits_valid)
+        }) || self.prefix_cache.host.entries.values().any(|e| {
+            e.tokens == input
+                && e.media.common_tokens(media, input.len()) == input.len()
+                && (!logits_valid || e.logits_valid)
+        });
+        if self.prefix_enabled()
+            && !same
+            && self
+                .manifest
+                .kv_cache
+                .as_ref()
+                .is_some_and(|k| k.direct_prefill)
+            && self
+                .manifest
+                .mtp
+                .as_ref()
+                .is_none_or(|s| s.hidden_ring.is_some())
+        {
+            let ranges = self.prefix_ranges(input.len())?;
+            let minimum = ranges.values().try_fold(0usize, |n, r| {
+                n.checked_add(r.bytes).ok_or("Prefix size overflow")
+            })?;
+            if minimum
+                > self
+                    .prefix_cache
+                    .device
+                    .budget
+                    .max(self.prefix_cache.host.budget)
+            {
+                context.statistics.store_s += at.elapsed().as_secs_f64();
+                self.update_prefix_usage(context);
+                return Ok(());
+            }
+            let kv_names: BTreeSet<_> = self
+                .manifest
+                .kv_cache
+                .as_ref()
+                .map(|k| k.buffers.keys().cloned().collect())
+                .unwrap_or_default();
+            // Non-KV ranges always need a private bank. The lower bound
+            // lets a finished request release its arena without warming the
+            // draft just to decline a speculative snapshot.
+            context.private_checkpoint_bytes = ranges
+                .iter()
+                .filter(|(name, _)| !kv_names.contains(*name))
+                .try_fold(0usize, |bytes, (_, range)| {
+                    bytes
+                        .checked_add(range.bytes)
+                        .ok_or("Prefix state size overflow")
+                })?;
+            let parent = context
+                .device_parent()
+                .and_then(|id| self.prefix_cache.device.entries.get(&id))
+                .filter(|e| {
+                    input.starts_with(&e.tokens)
+                        && e.media.common_tokens(media, e.tokens.len()) == e.tokens.len()
+                });
+            let adjacent = parent.is_some_and(|e| {
+                e.logits_valid && e.tokens.len() < input.len() && input.len() - e.tokens.len() <= 8
+            });
+            let plan =
+                self.execution
+                    .plan_snapshot(ranges, &kv_names, parent.map(|e| &e.snapshot))?;
+            let device = &self.prefix_cache.device;
+            let headroom = checkpoint_headroom(
+                context.private_checkpoint_bytes,
+                device
+                    .resident_with(Some(&plan))
+                    .saturating_add(plan.new_bytes),
+                device.budget,
+            );
+            let mut admission = device.admission(&plan, plan.new_bytes);
+            if !checkpoint.admits_device(&admission, adjacent, headroom) {
+                // Keep the nearby device parent for subsequent tokens and for
+                // the request's reservation when the final snapshot is redundant.
+                if !adjacent {
+                    self.store_host_prefix(
+                        input,
+                        media,
+                        warm_tokens,
+                        logits_valid,
+                        &plan,
+                        context,
+                    )?;
+                }
+                context.statistics.store_s += at.elapsed().as_secs_f64();
+                self.update_prefix_usage(context);
+                return Ok(());
+            }
+            let allow_evict = checkpoint.allows_eviction(adjacent);
+            // Reclaim before allocating so capture itself respects the budget,
+            // including shared blocks pinned by the pending checkpoint.
+            while admission != Admission::Ready {
+                if !(allow_evict && self.evict_prefix(Some(context))?) {
+                    return Err("Prefix budget planning failure".into());
+                }
+                admission = self.prefix_cache.device.admission(&plan, plan.new_bytes);
+            }
+            let snapshot = loop {
+                if let Some(s) = self.execution.snapshot(&plan)? {
+                    break Some(s);
+                }
+                if !(allow_evict && self.evict_prefix(Some(context))?) {
+                    break None;
+                }
+            };
+            if let Some(snapshot) = snapshot {
+                let fitting = self.prefix_cache.device.admission(&snapshot, 0);
+                if fitting == Admission::Ready || (fitting == Admission::Reclaim && allow_evict) {
+                    while self.prefix_cache.device.admission(&snapshot, 0) != Admission::Ready {
+                        if !(allow_evict && self.evict_prefix(Some(context))?) {
+                            return Err("Prefix budget accounting failure".into());
+                        }
+                    }
+                    // Upgrade a head-less endpoint, rather than keeping two states.
+                    let obsolete: Vec<_> = self
+                        .prefix_cache
+                        .device
+                        .entries
+                        .iter()
+                        .filter(|(_, e)| {
+                            e.tokens == input
+                                && e.media.common_tokens(media, input.len()) == input.len()
+                        })
+                        .map(|(&id, _)| id)
+                        .collect();
+                    for id in obsolete {
+                        let e = self.prefix_cache.device.remove(id).expect("known endpoint");
+                        self.execution.release_snapshot(e.snapshot)?;
+                    }
+                    let bytes = snapshot.bytes;
+                    self.remove_host_endpoint(input, media);
+                    let id = self.prefix_cache.device.insert(Entry::new(
+                        input.to_vec(),
+                        media.clone(),
+                        snapshot,
+                        bytes,
+                        warm_tokens,
+                        logits_valid,
+                    ));
+                    context.parent = Some((false, id));
+                    context.statistics.checkpoints_stored += 1;
+                } else {
+                    self.execution.release_snapshot(snapshot)?;
+                    if !adjacent {
+                        self.store_host_prefix(
+                            input,
+                            media,
+                            warm_tokens,
+                            logits_valid,
+                            &plan,
+                            context,
+                        )?;
+                    }
+                }
+            } else if !adjacent {
+                self.store_host_prefix(input, media, warm_tokens, logits_valid, &plan, context)?;
+            }
+        }
+        context.statistics.store_s += at.elapsed().as_secs_f64();
+        self.update_prefix_usage(context);
+        Ok(())
+    }
+    fn reserve_host_prefix(
+        &mut self,
+        banks: BTreeMap<u64, usize>,
+        extra: usize,
+        metadata: usize,
+        context: &mut Context,
+    ) -> bool {
+        let plan = crate::backend::kv::host::Budget(banks);
+        let Some(extra) = extra.checked_add(metadata) else {
+            return false;
+        };
+        loop {
+            match self.prefix_cache.host.admission(&plan, extra) {
+                crate::prefix::Admission::Ready => return true,
+                crate::prefix::Admission::TooLarge => return false,
+                crate::prefix::Admission::Reclaim => {
+                    if self.prefix_cache.host.evict_one().is_none() {
+                        return false;
+                    }
+                    context.statistics.host_evictions += 1;
+                }
+            }
+        }
+    }
+    fn host_metadata(tokens: usize, banks: usize) -> Result<usize> {
+        tokens
+            .checked_mul(16)
+            .and_then(|n| banks.checked_mul(1024).and_then(|b| n.checked_add(b)))
+            .and_then(|n| n.checked_add(8192))
+            .ok_or_else(|| "Host cache metadata overflow".into())
+    }
+    fn store_host_prefix(
+        &mut self,
+        input: &[u32],
+        media: &Media,
+        warm: usize,
+        logits: bool,
+        plan: &crate::backend::snapshot::Plan,
+        context: &mut Context,
+    ) -> Result<()> {
+        if self.prefix_cache.host.budget == 0 {
+            return Ok(());
+        }
+        let parent = context
+            .parent
+            .filter(|(host, _)| *host)
+            .and_then(|(_, id)| self.prefix_cache.host.entries.get(&id))
+            .filter(|e| {
+                input.starts_with(&e.tokens)
+                    && e.media.common_tokens(media, e.tokens.len()) == e.tokens.len()
+            })
+            .map(|e| &e.snapshot);
+        let plan = plan.for_host_parent(parent)?;
+        let banks = plan.host_banks();
+        let metadata =
+            Self::host_metadata(input.len(), banks.len().max(self.manifest.buffers.len()))?;
+        if !self.reserve_host_prefix(banks, plan.new_bytes, metadata, context) {
+            return Ok(());
+        }
+        let mut snapshot = self
+            .execution
+            .host_snapshot(&plan, &mut self.host_kv_pool)?;
+        snapshot.metadata_bytes = metadata;
+        let bytes = snapshot.bytes;
+        self.remove_host_endpoint(input, media);
+        let id = self.prefix_cache.host.insert(Entry::new(
+            input.to_vec(),
+            media.clone(),
+            snapshot,
+            bytes,
+            warm,
+            logits,
+        ));
+        context.parent = Some((true, id));
+        context.statistics.host_stores += 1;
+        context.statistics.checkpoints_stored += 1;
+        Ok(())
+    }
+    fn remove_host_endpoint(&mut self, input: &[u32], media: &Media) {
+        let ids: Vec<_> = self
+            .prefix_cache
+            .host
+            .entries
+            .iter()
+            .filter(|(_, e)| {
+                e.tokens == input && e.media.common_tokens(media, input.len()) == input.len()
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in ids {
+            self.prefix_cache.host.remove(id);
+        }
+    }
+    pub(super) fn evict_prefix(&mut self, context: Option<&mut Context>) -> Result<bool> {
+        let Some(id) = (if context.is_some() {
+            self.prefix_cache.device.victim_for_capture(|id| {
+                self.reserved_requests
+                    .values()
+                    .any(|request| request.prompt_prefix == Some(id))
+            })
+        } else {
+            self.prefix_cache.device.victim_except(None)
+        }) else {
+            return Ok(false);
+        };
+        let mut local = Context::default();
+        let context = context.unwrap_or(&mut local);
+        let mut host_snapshot = None;
+        if self.prefix_cache.host.budget > 0 {
+            let entry = &self.prefix_cache.device.entries[&id];
+            let banks = entry.snapshot.host_banks();
+            let metadata = Self::host_metadata(
+                entry.tokens.len(),
+                banks.len().max(self.manifest.buffers.len()),
+            )?;
+            if self.reserve_host_prefix(banks, 0, metadata, context) {
+                let entry = &self.prefix_cache.device.entries[&id];
+                let mut snapshot = self
+                    .execution
+                    .offload_snapshot(&entry.snapshot, &mut self.host_kv_pool)?;
+                snapshot.metadata_bytes = metadata;
+                host_snapshot = Some(snapshot);
+            }
+        }
+        // Keep the device endpoint indexed until the CPU copy is complete.
+        let entry = self
+            .prefix_cache
+            .device
+            .remove(id)
+            .ok_or("Missing device prefix")?;
+        let source = if let Some(snapshot) = host_snapshot {
+            self.remove_host_endpoint(&entry.tokens, &entry.media);
+            let (entry, source) = entry.replace_snapshot(snapshot);
+            self.prefix_cache.host.insert(entry);
+            context.statistics.host_stores += 1;
+            source
+        } else {
+            entry.snapshot
+        };
+        self.execution.release_snapshot(source)?;
+        context.statistics.evictions += 1;
+        Ok(true)
+    }
+    fn update_prefix_usage(&self, context: &mut Context) {
+        self.prefix_cache
+            .update_statistics(1, &mut context.statistics);
+    }
+    pub(super) fn store_decoded_prefix(
+        &mut self,
+        history: &[u32],
+        media: &Media,
+        cancelled: &impl Fn() -> bool,
+        context: &mut Context,
+    ) -> Result<()> {
+        let position = self.read_control(&self.manifest.position)? as usize;
+        if self.prefix_enabled() && !cancelled() && position != 0 && position <= history.len() {
+            let spec = self.manifest.mtp.clone();
+            let warm = if let Some(s) = &spec {
+                // The draft has already consumed the pending token's embedding.
+                // Cache only the prefix-consistent P-1 range; preserve the live cursor.
+                let old = self.read_control(&s.position)? as usize;
+                if old != position {
+                    return Err("Decoded MTP cache position mismatch".into());
+                }
+                self.upload_ids(&s.position, &[(position - 1) as u32])?;
+                position - 1
+            } else {
+                0
+            };
+            let result = self.store_prefix(
+                &history[..position],
+                media,
+                warm,
+                Checkpoint::Decoded,
+                context,
+            );
+            if let Some(s) = &spec {
+                self.upload_ids(&s.position, &[position as u32])?;
+            }
+            result?;
+        }
+        self.execution.collect_snapshots()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn costly_checkpoints_leave_room_for_other_requests() {
+        let budget = 4 << 30;
+        let private = 150 << 20;
+        let spare = checkpoint_headroom(private, 1500 << 20, budget);
+        let tight = checkpoint_headroom(private, 3500 << 20, budget);
+        let small = checkpoint_headroom(18 << 20, 3500 << 20, budget);
+        assert!(spare && small && !tight);
+        for headroom in [spare, small] {
+            assert!(Checkpoint::Reusable.admits_device(&Admission::Ready, true, headroom));
+        }
+        for admission in [Admission::Ready, Admission::Reclaim] {
+            for kind in [Checkpoint::Intermediate, Checkpoint::Decoded] {
+                assert!(!kind.admits_device(&admission, false, tight));
+            }
+            assert!(!Checkpoint::Reusable.admits_device(&admission, true, tight));
+            assert!(Checkpoint::Reusable.admits_device(&admission, false, tight));
+        }
+        assert!(!Checkpoint::Reusable.admits_device(&Admission::Reclaim, true, spare));
+        assert!(Checkpoint::prefill(8184, 8192, 0) == Checkpoint::Reusable);
+        assert!(Checkpoint::prefill(8183, 8192, 0) == Checkpoint::Intermediate);
+        assert!(Checkpoint::prefill(4096, 8192, 4096) == Checkpoint::Reusable);
+    }
+
+    #[test]
+    fn media_hash_preserves_little_endian_float_bits_and_tails() {
+        let values: Vec<_> = (0..1025u32)
+            .map(|i| f32::from_bits(i.wrapping_mul(1664525)))
+            .chain([0., -0., f32::INFINITY, f32::from_bits(0x7fc00001)])
+            .collect();
+        for n in [0, 1, 255, 256, 257, 1025, values.len()] {
+            let mut expected = Sha256::new();
+            for value in &values[..n] {
+                expected.update(value.to_bits().to_le_bytes());
+            }
+            let mut actual = Sha256::new();
+            hash_floats(&mut actual, &values[..n]);
+            assert_eq!(actual.finalize(), expected.finalize());
+        }
+    }
+}
