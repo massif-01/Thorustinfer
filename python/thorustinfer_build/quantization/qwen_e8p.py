@@ -140,6 +140,7 @@ def text_configuration(config):
         # Canonical workspace width; the expert/shared widths remain explicit.
         t["intermediate_size"] = t["shared_expert_intermediate_size"]
     elif (t.get("hidden_size"), t.get("intermediate_size"), t.get("num_hidden_layers")) not in (
+        (1024, 3584, 24),
         (2048, 6144, 24),
         (2560, 9216, 32),
         (4096, 12288, 32),

@@ -110,6 +110,12 @@ Qwen3.5-4B 在 T5000 上测过 E8P 和 NVFP4 W4A4 两档。要在两档之间选
 - **鉴权与监控**：设置 `THORUSTINFER_API_KEY` 后，HTTP 请求需携带 `Authorization: Bearer <key>`。管理服务的 `/api/version` 返回产品和版本，模型服务的 `/metrics` 提供前缀为 `thorustinfer_` 的指标。
 - **数据与资源**：用 `THORUSTINFER_DATA_DIR` 指定管理数据目录，`THORUSTINFER_EXECUTION_CACHE` 指定执行包缓存。默认路径分别位于用户数据目录和缓存目录的 `thorustinfer` 子目录。`--memory-reserve-mib` 为系统预留内存，`--max-active-requests` 限制并发数。设备已有共享 GPU 锁时，给 `--gpu-lock` 传入该锁的路径。
 
+## 上下文与草稿模型
+
+`"$CLI" serve "$MODEL_DIR" --context auto --kv-cache-mib "$KV_MIB"` 使用指定的物理页预算。将 `KV_MIB` 设置为此 worker 可用的正整数 MiB。用 `--context N` 指定输入加输出的 token 上限，`--context-concurrency C` 指定同时达到上限的请求数。`/health` 的 `context_plan` 显示实际容量和页占用。
+
+带验证器的 W4A4 包可显式启用 `--spec-method mtp` 或 `--spec-method prompt-lookup`。独立草稿使用 `--spec-method draft --draft-model "$SMALL_MODEL"`。与目标匹配的块草稿包使用 `dflash`、`dflash2` 或 `dspark`，沿用 `--draft-model`。`--draft-confidence P` 可启用 DSpark 的置信度截断。小模型与块草稿以单请求、纯文本、无惩罚 greedy 为适用条件，其他请求沿用主模型。
+
 ## 从源码构建
 
 如需自行编译，请从同一交付位置取得 `thorustinfer-0.2.1-source.tar.xz`，按其中单列的 `BUILD.md` 准备 Rust、Python 和 CUDA 开发工具。用运行包内的 `licenses/CORRESPONDING-SOURCE.sha256` 核对源码归档。

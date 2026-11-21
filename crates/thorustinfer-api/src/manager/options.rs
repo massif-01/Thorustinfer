@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkerOptions {
+    #[serde(flatten)]
+    pub context_options: thorustinfer_engine::execution::ContextOptions,
     pub cuda_graph: String,
     pub mtp_drafts: String,
     pub resident_experts: String,
@@ -20,6 +22,9 @@ pub struct WorkerOptions {
     pub memory_reserve_mib: usize,
     pub load_workers: Option<usize>,
     pub verify_weights: bool,
+    pub draft_confidence: Option<f32>,
+    pub draft_model: Option<PathBuf>,
+    pub spec_method: Option<thorustinfer_engine::execution::SpecMethod>,
     pub prompt_lookup: bool,
     pub preprocess_workers: usize,
     pub preprocess_memory_mib: usize,
@@ -30,6 +35,7 @@ pub struct WorkerOptions {
 impl Default for WorkerOptions {
     fn default() -> Self {
         Self {
+            context_options: Default::default(),
             cuda_graph: "decode_only".into(),
             mtp_drafts: "auto".into(),
             resident_experts: "full".into(),
@@ -43,6 +49,9 @@ impl Default for WorkerOptions {
             memory_reserve_mib: 1024,
             load_workers: None,
             verify_weights: false,
+            draft_confidence: None,
+            draft_model: None,
+            spec_method: None,
             prompt_lookup: false,
             preprocess_workers: 0,
             preprocess_memory_mib: 2048,
@@ -55,6 +64,7 @@ impl Default for WorkerOptions {
 impl WorkerOptions {
     pub fn from_settings(settings: &ServerConfig) -> Self {
         Self {
+            context_options: settings.context_options,
             cuda_graph: settings.cuda_graph.to_string(),
             mtp_drafts: settings
                 .mtp_drafts
@@ -70,6 +80,9 @@ impl WorkerOptions {
             memory_reserve_mib: settings.scheduler.memory_reserve_bytes >> 20,
             load_workers: settings.load_workers,
             verify_weights: settings.verify_weights,
+            draft_confidence: settings.draft_confidence,
+            draft_model: settings.draft_model.clone(),
+            spec_method: settings.spec_method,
             prompt_lookup: settings.prompt_lookup,
             preprocess_workers: settings.limits.preprocess_workers,
             preprocess_memory_mib: settings.limits.memory_mib,
@@ -82,6 +95,7 @@ impl WorkerOptions {
         Ok(ServerConfig {
             model_dir: path.into(),
             model: name.into(),
+            context_options: self.context_options,
             cuda_graph: self.cuda_graph.parse()?,
             mtp_drafts: thorustinfer_engine::execution::parse_mtp_drafts(&self.mtp_drafts)?,
             resident_experts: self.resident_experts.parse()?,
@@ -95,6 +109,9 @@ impl WorkerOptions {
                 .ok_or("CPU offload budget overflow")?,
             load_workers: self.load_workers,
             verify_weights: self.verify_weights,
+            draft_confidence: self.draft_confidence,
+            draft_model: self.draft_model.clone(),
+            spec_method: self.spec_method,
             prompt_lookup: self.prompt_lookup,
             default_request_params: self.default_request_params.clone(),
             scheduler: thorustinfer_engine::scheduler::Options {
@@ -123,8 +140,6 @@ impl WorkerOptions {
         let mut args = vec![
             "--cuda-graph".into(),
             self.cuda_graph.clone(),
-            "--mtp-drafts".into(),
-            self.mtp_drafts.clone(),
             "--resident-experts".into(),
             self.resident_experts.clone(),
             "--kv-offload-mib".into(),
@@ -158,11 +173,31 @@ impl WorkerOptions {
             "--default-request-params".into(),
             serde_json::to_string(&self.default_request_params).unwrap(),
         ];
+        if let Some(v) = self.context_options.context {
+            args.extend(["--context".into(), v.to_string()]);
+        }
+        if let Some(v) = self.context_options.kv_cache_mib {
+            args.extend(["--kv-cache-mib".into(), v.to_string()]);
+        }
+        if let Some(v) = self.context_options.context_concurrency {
+            args.extend(["--context-concurrency".into(), v.to_string()]);
+        }
         if let Some(n) = self.load_workers {
             args.extend(["--load-workers".into(), n.to_string()]);
         }
         if self.verify_weights {
             args.push("--verify-weights".into());
+        }
+        if let Some(v) = self.draft_confidence {
+            args.extend(["--draft-confidence".into(), v.to_string()]);
+        }
+        if let Some(path) = &self.draft_model {
+            args.extend(["--draft-model".into(), path.to_string_lossy().into_owned()]);
+        }
+        if let Some(method) = self.spec_method {
+            args.extend(["--spec-method".into(), method.to_string()]);
+        } else {
+            args.extend(["--mtp-drafts".into(), self.mtp_drafts.clone()]);
         }
         if self.prompt_lookup {
             args.push("--prompt-lookup".into());

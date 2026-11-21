@@ -7,8 +7,133 @@ pub use thorustinfer_device::GraphMode;
 /// Compatibility name for existing callers and serialized load options.
 pub type CudaGraphMode = GraphMode;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "serde_json::Value", into = "serde_json::Value")]
+pub enum ContextLimit {
+    Auto,
+    Tokens(std::num::NonZeroUsize),
+}
+impl FromStr for ContextLimit {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self> {
+        if s == "auto" {
+            Ok(Self::Auto)
+        } else {
+            s.parse()
+                .map(Self::Tokens)
+                .map_err(|_| "context must be auto or a positive token count".into())
+        }
+    }
+}
+impl fmt::Display for ContextLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Tokens(n) => write!(f, "{n}"),
+        }
+    }
+}
+impl TryFrom<serde_json::Value> for ContextLimit {
+    type Error = String;
+    fn try_from(v: serde_json::Value) -> Result<Self> {
+        match v {
+            serde_json::Value::String(s) => s.parse(),
+            serde_json::Value::Number(n) => n.to_string().parse(),
+            _ => Err("Invalid context".into()),
+        }
+    }
+}
+impl From<ContextLimit> for serde_json::Value {
+    fn from(v: ContextLimit) -> Self {
+        match v {
+            ContextLimit::Auto => serde_json::json!("auto"),
+            ContextLimit::Tokens(n) => serde_json::json!(n),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ContextOptions {
+    pub context: Option<ContextLimit>,
+    pub kv_cache_mib: Option<std::num::NonZeroUsize>,
+    pub context_concurrency: Option<std::num::NonZeroUsize>,
+}
+impl ContextOptions {
+    pub fn plans_capacity(self) -> bool {
+        self.kv_cache_mib.is_some()
+            || self.context_concurrency.is_some()
+            || self.context == Some(ContextLimit::Auto)
+    }
+    pub fn kv_bytes(self) -> Result<usize> {
+        self.kv_cache_mib
+            .map_or(0, usize::from)
+            .checked_mul(1 << 20)
+            .ok_or("KV budget overflows byte count".into())
+    }
+}
+#[derive(Clone, Debug, Default)]
+pub struct ContextPlan {
+    pub package: usize,
+    pub effective: usize,
+    pub owners: usize,
+    pub requested_bytes: usize,
+    pub pool_bytes: usize,
+    pub planned_growth_bytes: usize,
+    pub other_worker_bytes: usize,
+    pub used: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+impl ContextPlan {
+    pub fn report(&self) -> serde_json::Value {
+        serde_json::json!({"package_context":self.package,"effective_context":self.effective,"planning_concurrency":self.owners,"requested_kv_bytes":self.requested_bytes,"pool_bytes":self.pool_bytes,"planned_growth_bytes":self.planned_growth_bytes,"other_worker_bytes":self.other_worker_bytes,"used_pool_bytes":self.used.load(std::sync::atomic::Ordering::Relaxed)})
+    }
+}
+
 /// Public request bound; each execution package validates its supported depths.
 pub const MAX_MTP_DRAFTS: usize = 31;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SpecMethod {
+    None,
+    Mtp,
+    PromptLookup,
+    Draft,
+    Dflash,
+    Dflash2,
+    Dspark,
+}
+
+impl SpecMethod {
+    pub fn uses_draft_model(self) -> bool {
+        matches!(
+            self,
+            Self::Draft | Self::Dflash | Self::Dflash2 | Self::Dspark
+        )
+    }
+}
+impl FromStr for SpecMethod {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self> {
+        serde::Deserialize::deserialize(
+            serde::de::value::StrDeserializer::<serde::de::value::Error>::new(value),
+        )
+        .map_err(|e| e.to_string())
+    }
+}
+
+impl std::fmt::Display for SpecMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "none",
+            Self::Mtp => "mtp",
+            Self::Draft => "draft",
+            Self::Dflash => "dflash",
+            Self::Dflash2 => "dflash2",
+            Self::Dspark => "dspark",
+            Self::PromptLookup => "prompt-lookup",
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LoadOptions {
@@ -26,6 +151,7 @@ pub struct LoadOptions {
     /// None keeps the package default; zero disables speculative execution.
     pub mtp_drafts: Option<usize>,
     /// Opt in to target-verified proposals copied from the request history.
+    pub spec_method: Option<SpecMethod>,
     pub prompt_lookup: bool,
 }
 

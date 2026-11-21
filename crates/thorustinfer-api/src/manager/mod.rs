@@ -35,6 +35,9 @@ struct Runner {
     child: Mutex<Child>,
     client: reqwest::Client,
     active: AtomicUsize,
+    effective_context: AtomicUsize,
+    plans_capacity: bool,
+    planned_growth: AtomicUsize,
     last_used: SyncMutex<Instant>,
     keep_alive_s: AtomicU64,
     draining: AtomicBool,
@@ -307,14 +310,18 @@ impl Manager {
     }
 
     async fn start(&self, record: &ModelRecord, key: &str) -> Result<(Arc<Runner>, MemoryBudget)> {
-        let actual = thorustinfer_engine::artifact::sha256(
+        let actual = registry::model_identity(
             &fs::read(record.path.join("cache/model.json")).map_err(|e| e.to_string())?,
-        );
+            &record.options,
+        )?;
         if actual != record.identity {
             return Err("Model identity changed; import the new version before loading".into());
         }
         self.reserve_space(record).await?;
-        let budget = self.reserve_budget(record.load_bytes, BudgetKind::Loading)?;
+        let other_growth = self.runners.lock().await.values().fold(0usize, |n, r| {
+            n.saturating_add(r.planned_growth.load(Ordering::Acquire))
+        });
+        let budget = self.reserve_budget(record.start_bytes()?, BudgetKind::Loading)?;
         let directory = self.directory.join(&key[..16]);
         private_directory(&directory)?;
         let socket = directory.join("thorustinfer-worker.sock");
@@ -330,6 +337,16 @@ impl Manager {
         // Alias-specific sampling defaults are applied by the gateway.
         options.default_request_params.clear();
         let mut command = self.command();
+        let outstanding = {
+            let budgets = self.budgets.lock().unwrap_or_else(|e| e.into_inner());
+            budgets
+                .requests
+                .saturating_add(budgets.loading.saturating_sub(budget.bytes))
+        };
+        command.env(
+            "THORUSTINFER_WORKER_PLANNING_BYTES",
+            other_growth.saturating_add(outstanding).to_string(),
+        );
         command
             .arg("worker")
             .arg(&record.path)
@@ -358,6 +375,9 @@ impl Manager {
                 child: Mutex::new(child),
                 client,
                 active: AtomicUsize::new(0),
+                effective_context: AtomicUsize::new(record.max_context),
+                plans_capacity: record.options.context_options.plans_capacity(),
+                planned_growth: AtomicUsize::new(0),
                 last_used: SyncMutex::new(Instant::now()),
                 batch: false,
                 keep_alive_s: AtomicU64::new(self.config.keep_alive_s),
@@ -415,6 +435,19 @@ impl Manager {
                 && health["status"] == "ready"
                 && health["model"] == runner.model
             {
+                if let Some(ctx) = health["max_context"]
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                {
+                    runner.effective_context.store(ctx, Ordering::Release);
+                    runner.planned_growth.store(
+                        health["context_plan"]["planned_growth_bytes"]
+                            .as_u64()
+                            .and_then(|v| usize::try_from(v).ok())
+                            .unwrap_or(0),
+                        Ordering::Release,
+                    );
+                }
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -461,6 +494,17 @@ impl Manager {
     async fn reserve_space(&self, record: &ModelRecord) -> Result<()> {
         loop {
             let runners: Vec<_> = self.runners.lock().await.values().cloned().collect();
+            // A dynamically sized worker publishes its growth reservation at readiness.
+            // Default workers may still overlap startup with one another.
+            if runners.iter().any(|r| {
+                r.loading.load(Ordering::Acquire)
+                    && (r.plans_capacity || record.options.context_options.plans_capacity())
+            }) {
+                return Err("Model is loading".into());
+            }
+            let other_growth = runners.iter().fold(0usize, |n, r| {
+                n.saturating_add(r.planned_growth.load(Ordering::Acquire))
+            });
             let count_full = self
                 .config
                 .max_loaded_models
@@ -472,7 +516,8 @@ impl Manager {
                 self.memory_headroom()?
                     .saturating_sub(total.requests)
                     .saturating_sub(total.loading)
-                    >= record.load_bytes
+                    .saturating_sub(other_growth)
+                    >= record.start_bytes()?
             };
             if !count_full && fits {
                 break;
@@ -551,8 +596,12 @@ impl Manager {
         let tokens = input_bytes
             .saturating_add(usize::try_from(output).unwrap_or(usize::MAX))
             .min(record.max_context);
-        let bytes = record
-            .kv_bytes_per_token
+        let kv_stride = if record.options.context_options.kv_cache_mib.is_some() {
+            0
+        } else {
+            record.kv_bytes_per_token
+        };
+        let bytes = kv_stride
             .checked_mul(tokens)
             .and_then(|n| n.checked_add(record.sequence_bytes))
             .ok_or("Request memory estimate overflow")?;
@@ -720,7 +769,7 @@ impl Manager {
         let records = self.records.lock().await;
         json!(runners.iter().map(|r| json!({"model":r.model,"pid":r.pid,"active_requests":r.active.load(Ordering::Acquire),
             "state":if r.draining.load(Ordering::Acquire) {"draining"} else if r.loading.load(Ordering::Acquire) {"loading"} else if r.batch {"batch"} else {"ready"},
-            "estimated_load_bytes":records.values().find(|record| runner_key(record)==r.key).map(|record| record.load_bytes),
+            "effective_context":r.effective_context.load(Ordering::Acquire),"planned_growth_bytes":r.planned_growth.load(Ordering::Acquire),"estimated_load_bytes":records.values().find(|record| runner_key(record)==r.key).map(|record| record.load_bytes),
             "idle_s":r.last_used.lock().unwrap_or_else(|e| e.into_inner()).elapsed().as_secs_f64(),
             "keep_alive_s":r.keep_alive_s.load(Ordering::Relaxed),"log":r.directory.join("worker.log")})).collect::<Vec<_>>())
     }

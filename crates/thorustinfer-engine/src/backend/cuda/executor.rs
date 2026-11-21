@@ -183,11 +183,6 @@ impl Executor {
         let manifest = &prepared.plan;
         let target = thorustinfer_device::Target::from_package(&manifest.target)?;
         target.require_host(std::env::consts::ARCH)?;
-        if prepared.policy == "nvfp4_ffn"
-            && (options.mtp_drafts.unwrap_or(0) > 0 || options.prompt_lookup)
-        {
-            return Err("The Thor W4A4 profile supports target decoding; choose E8P for speculative decoding".into());
-        }
         let base = &prepared.weights_root;
         let kernel_base = &prepared.kernel_root;
         let scopes = &prepared.scopes;

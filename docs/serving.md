@@ -66,7 +66,7 @@ curl http://127.0.0.1:8088/api/chat -d '{"model":"index-translate-2b","messages"
 
 返回实际测量的 token/cache 计数和请求总时长（纳秒）。响应按实际测量提供字段；`/api/ps.estimated_load_bytes` 报告内存准入估算值，实际 VRAM 占用需独立测量。`THORUSTINFER_API_KEY` 同时保护 `/api` 与 `/v1`。
 
-当前模型由 CLI 导入原生 thorustinfer 包；Ollama registry 的 pull/push/create、embedding 接口、raw prompt、suffix、Go template 覆盖、旧 token context 和自动截断/滑窗明确返回错误。上下文由模型执行包确定，`options.num_ctx` 可省略或使用该值。
+当前模型由 CLI 导入原生 thorustinfer 包；Ollama registry 的 pull/push/create、embedding 接口、raw prompt、suffix、Go template 覆盖、旧 token context 和自动截断/滑窗明确返回错误。worker 加载后固定本次有效上下文。可从 `/api/ps` 读取就绪 worker 的 `context_length`，`options.num_ctx` 可省略或使用该值。
 
 ## Chat API
 

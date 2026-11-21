@@ -237,6 +237,9 @@ impl ModelRuntime {
         options: &scheduler::Options,
         slack: f64,
     ) -> Option<BatchChoice> {
+        if self.lookup_only || self.independent_draft() {
+            return None;
+        }
         let spec = self.manifest.mtp.as_ref()?;
         let key = Self::speculation_key(requests, joint);
         if key.batch == 0 {
@@ -732,6 +735,9 @@ impl ModelRuntime {
         max_rows: usize,
         slack: f64,
     ) -> Option<LookupChoice> {
+        if self.lookup_only || self.independent_draft() {
+            return None;
+        }
         let spec = self.manifest.mtp.as_ref()?;
         let batch = self.manifest.sampling.as_ref()?.batch.as_ref()?;
         // The commit must preserve the target hidden history for lazy draft
@@ -982,6 +988,12 @@ impl ModelRuntime {
                 .take_while(|(a, b)| a == b)
                 .count();
             req.mtp.accepted_draft_tokens += accepted;
+            if self.trace_proposals {
+                eprintln!(
+                    "VERIFIED_ROUND {}",
+                    serde_json::json!({"slot":req.slot,"position":round.position,"proposed":round.drafts.len(),"accepted":accepted,"committed":tokens.len()})
+                );
+            }
             req.mtp.lookup_accepted_draft_tokens += accepted;
             req.prompt_lookup.observe(
                 accepted,
@@ -1410,11 +1422,35 @@ impl ModelRuntime {
                     .propose(&req.core.history, plan.tokens - 1)
             })
             .flatten();
+        if self.lookup_only && lookup.is_none() {
+            self.execute_target_tail(req)?;
+            return Ok(DraftPreparation::Finished(self.commit_ordinary_token(req)?));
+        }
+        let proposed = if let Some(draft) = &mut self.external_draft {
+            Some(draft.propose_external(req, plan.tokens - 1)?)
+        } else {
+            None
+        };
+        let proposed = if self.block_draft.is_some() {
+            let at = Instant::now();
+            let ids = self.block_candidates(req, plan.tokens - 1)?;
+            req.mtp.draft_s += at.elapsed().as_secs_f64();
+            Some(ids)
+        } else {
+            proposed
+        };
+        let plan = if let Some(ids) = proposed.as_ref() {
+            spec.verification_plan(ids.len() + 1)
+                .ok_or("Draft returned unsupported verification width")?
+        } else {
+            plan
+        };
+        let is_external = proposed.is_some();
         let is_lookup = lookup.is_some();
         if !is_lookup && let Some(save) = &spec.draft_snapshot_program {
             self.launch_program(save, ExecutionPhase::Decode)?;
         }
-        let drafts = lookup.unwrap_or_default();
+        let drafts = proposed.or(lookup).unwrap_or_default();
         if is_lookup {
             req.mtp.lookup_rounds += 1;
             req.mtp.lookup_proposed_tokens += drafts.len();
@@ -1433,7 +1469,7 @@ impl ModelRuntime {
             },
             decoder: req.decoder.fork(),
             history: req.history.clone(),
-            done: is_lookup,
+            done: is_lookup || is_external,
             failed: false,
             started: Instant::now(),
         })))
@@ -1467,6 +1503,76 @@ impl ModelRuntime {
             Ok(())
         }
     }
+    fn propose_external(&mut self, owner: &mut RequestState, count: usize) -> Result<Vec<u32>> {
+        let at = Instant::now();
+        let history = &owner.core.history;
+        let scheduler = scheduler::Options::default();
+        let mut state = owner.external_state.take();
+        // All accepted proposals still leave one pending draft input. Advance it
+        // to consume the final accepted token, then substitute the target bonus.
+        if let Some(req) = state.as_mut()
+            && history.len() == req.history.len() + 1
+            && history.starts_with(&req.history)
+        {
+            self.with_request(req, |model, req| {
+                model.execute_target_tail(req)?;
+                model.commit_ordinary_token(req)
+            })?;
+        }
+        if let Some(req) = state.as_mut() {
+            if req.history.len() == history.len()
+                && req.history[..history.len() - 1] == history[..history.len() - 1]
+            {
+                *req.history.last_mut().unwrap() = *history.last().unwrap();
+                self.execution.upload_sequence_ids(
+                    req.slot,
+                    &self.manifest.token,
+                    &history[history.len() - 1..],
+                )?;
+            } else {
+                self.finish_request(req, false)?;
+                state = None;
+            }
+        }
+        let mut proposals = Vec::with_capacity(count);
+        let mut req = if let Some(req) = state {
+            req
+        } else {
+            let began = Instant::now();
+            let mut req = Box::new(self.start_request(
+                GenerationInput {
+                    input_tokens: history.clone(),
+                    images: vec![],
+                    audios: vec![],
+                    max_new_tokens: owner.limit - owner.generated,
+                    sampling: crate::sampling::Options {
+                        temperature: 0.,
+                        ..Default::default()
+                    },
+                    prefix_hints: vec![],
+                },
+                &|| false,
+            )?);
+            while req.prefilling {
+                self.advance_requests(&mut [&mut req], &scheduler)?;
+            }
+            owner.mtp.draft_prefill_tokens += history.len();
+            owner.mtp.draft_prefill_s += began.elapsed().as_secs_f64();
+            proposals.push(*req.history.last().ok_or("Missing draft output")?);
+            req
+        };
+        while proposals.len() < count {
+            let tokens = self.with_request(&mut req, |model, req| {
+                model.execute_target_tail(req)?;
+                model.commit_ordinary_token(req)
+            })?;
+            proposals.push(*tokens.first().ok_or("Empty greedy draft output")?);
+        }
+        owner.external_state = Some(req);
+        owner.mtp.draft_s += at.elapsed().as_secs_f64();
+        Ok(proposals)
+    }
+
     fn consume_draft(
         &mut self,
         req: &mut RequestState,
@@ -1766,6 +1872,12 @@ impl ModelRuntime {
                 .count()
         };
         req.mtp.accepted_draft_tokens += accepted;
+        if self.trace_proposals {
+            eprintln!(
+                "VERIFIED_ROUND {}",
+                serde_json::json!({"slot":req.slot,"position":position,"proposed":drafts.len(),"accepted":accepted,"committed":committed.len()})
+            );
+        }
         if !is_lookup {
             req.draft_acceptance.observe(drafts.len(), accepted);
         }
@@ -2230,3 +2342,6 @@ mod policy_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod target_verification_test;

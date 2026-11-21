@@ -94,10 +94,10 @@ def configuration(config, context):
             shared_expert_intermediate_size=512,
             mlp_only_layers=[],
         )
-    elif t.get("hidden_size") == 2048:
+    elif t.get("hidden_size") in (1024, 2048):
         expected.update(
-            hidden_size=2048,
-            intermediate_size=6144,
+            hidden_size=t["hidden_size"],
+            intermediate_size=3584 if t["hidden_size"] == 1024 else 6144,
             num_hidden_layers=24,
             linear_num_value_heads=16,
             num_attention_heads=8,

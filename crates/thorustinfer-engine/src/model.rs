@@ -366,10 +366,58 @@ impl Model {
         Self::load_with_options(path, LoadOptions::default())
     }
     pub fn load_with_options(path: &Path, options: LoadOptions) -> Result<Self> {
-        crate::runtime::ModelRuntime::load_with_options(path, options).map(Self)
+        Self::load_with_draft(path, options, None, None)
+    }
+    pub fn load_with_draft(
+        path: &Path,
+        options: LoadOptions,
+        draft: Option<&Path>,
+        confidence: Option<f32>,
+    ) -> Result<Self> {
+        if options.spec_method.is_some_and(|m| m.uses_draft_model()) != draft.is_some() {
+            return Err("The selected proposal method and draft model must match".into());
+        }
+        let mut model = Self(crate::runtime::ModelRuntime::load_with_options(
+            path, options,
+        )?);
+        if let Some(draft) = draft {
+            model.attach_draft(draft, options, confidence)?;
+        }
+        Ok(model)
+    }
+    fn attach_draft(
+        &mut self,
+        path: &Path,
+        options: LoadOptions,
+        confidence: Option<f32>,
+    ) -> Result<()> {
+        if let Some(method) = options.spec_method
+            && method != crate::execution::SpecMethod::Draft
+        {
+            return self
+                .0
+                .attach_block(path, method, confidence, options.verify_weights);
+        }
+        let draft = crate::runtime::ModelRuntime::load_with_options(
+            path,
+            LoadOptions {
+                spec_method: Some(crate::execution::SpecMethod::None),
+                prefix_cache_bytes: 0,
+                kv_offload_bytes: 0,
+                ..options
+            },
+        )?;
+        self.0.attach_draft(draft)
+    }
+    pub fn configure_context(
+        &mut self,
+        options: crate::execution::ContextOptions,
+        scheduler: &crate::scheduler::Options,
+    ) -> Result<crate::execution::ContextPlan> {
+        self.0.configure_context(options, scheduler)
     }
     pub fn max_context(&self) -> usize {
-        self.0.manifest.max_context
+        self.0.effective_context
     }
     pub fn mtp_drafts(&self) -> usize {
         self.0

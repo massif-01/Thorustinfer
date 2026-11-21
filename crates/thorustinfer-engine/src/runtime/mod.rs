@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 mod audio;
 mod benchmark;
+mod block_draft;
+mod context;
 mod generation;
 #[cfg(test)]
 #[path = "../mtp_gpu_tests.rs"]
@@ -25,6 +27,7 @@ mod vision;
 
 pub(crate) struct ModelRuntime {
     pub(crate) frontend_assets: std::collections::BTreeMap<String, String>,
+    pub(crate) effective_context: usize,
     pub(crate) manifest: crate::model::Manifest,
     execution: Executor,
     stats: LoadStats,
@@ -48,6 +51,12 @@ pub(crate) struct ModelRuntime {
     prefill_alternative: Option<requests::cost::Alternative>,
     mtp_seconds_per_draft: f64,
     dynamic_speculation: requests::speculation::control::Controller,
+    checkpoint: Option<(String, String)>,
+    block_draft: Option<block_draft::BlockDraft>,
+    confidence: Option<f32>,
+    external_draft: Option<Box<ModelRuntime>>,
+    trace_proposals: bool,
+    lookup_only: bool,
     prompt_lookup: bool,
     sampled_lookup_costs: std::collections::BTreeMap<(usize, usize), crate::scheduler::Timing>,
     startup_costs: std::collections::BTreeMap<(usize, usize, bool), crate::scheduler::Estimate>,
@@ -90,6 +99,48 @@ impl ModelRuntime {
             .mtp
             .as_ref()
             .and_then(|s| s.hidden_ring.clone());
+        let mut options = options;
+        use crate::execution::SpecMethod;
+        if (options.mtp_drafts.is_some_and(|n| n > 0)
+            || options.spec_method == Some(SpecMethod::Mtp))
+            && !prepared.native_mtp
+        {
+            return Err("Selected model package has no native MTP draft head".into());
+        }
+        if (options
+            .spec_method
+            .is_some_and(|method| method != SpecMethod::None)
+            || (prepared.policy == "nvfp4_ffn" && options.prompt_lookup))
+            && !prepared.target_verification
+        {
+            return Err("Selected model package has no target verification plans".into());
+        }
+        let lookup_only = options.spec_method == Some(SpecMethod::PromptLookup);
+        match options.spec_method {
+            Some(SpecMethod::None) => options.mtp_drafts = Some(0),
+            Some(
+                SpecMethod::Mtp
+                | SpecMethod::PromptLookup
+                | SpecMethod::Draft
+                | SpecMethod::Dflash
+                | SpecMethod::Dflash2
+                | SpecMethod::Dspark,
+            ) => {
+                let spec =
+                    prepared.plan.mtp.as_ref().ok_or(
+                        "Selected method requires a package with target verification plans",
+                    )?;
+                options.mtp_drafts = Some(spec.default_verification_tokens - 1);
+                options.prompt_lookup = lookup_only;
+            }
+            None if prepared.policy == "nvfp4_ffn"
+                && options.mtp_drafts.is_none()
+                && !options.prompt_lookup =>
+            {
+                options.mtp_drafts = Some(0)
+            }
+            None => {}
+        }
         options.configure_mtp(&mut prepared.plan)?;
         let preload = startup::kernels(&prepared.plan, prepared.execution_model.as_ref())?;
         let indirect_packets = prepared.plan.packet_table().is_some();
@@ -122,6 +173,7 @@ impl ModelRuntime {
         }
         Ok(Self {
             frontend_assets: prepared.frontend_assets,
+            effective_context: prepared.plan.max_context,
             manifest: prepared.plan,
             execution,
             stats,
@@ -148,6 +200,12 @@ impl ModelRuntime {
             prefill_alternative: None,
             mtp_seconds_per_draft: 0.055,
             dynamic_speculation: Default::default(),
+            checkpoint: prepared.checkpoint,
+            block_draft: None,
+            confidence: None,
+            external_draft: None,
+            trace_proposals: std::env::var_os("THORUSTINFER_TRACE_PROPOSALS").is_some(),
+            lookup_only,
             prompt_lookup: options.prompt_lookup,
             sampled_lookup_costs: Default::default(),
             startup_costs: Default::default(),
@@ -158,6 +216,45 @@ impl ModelRuntime {
             request_hidden_ring,
             idle_admission_since: None,
         })
+    }
+    pub(crate) fn attach_block(
+        &mut self,
+        path: &std::path::Path,
+        method: crate::execution::SpecMethod,
+        confidence: Option<f32>,
+        verify: bool,
+    ) -> Result<()> {
+        let layout = self
+            .manifest
+            .batch_layout
+            .as_ref()
+            .ok_or("Block drafts require a Qwen layer layout")?;
+        self.block_draft = Some(block_draft::BlockDraft::load(
+            path,
+            method,
+            layout.hidden,
+            self.manifest.vocab,
+            layout.layers.len(),
+            self.checkpoint
+                .as_ref()
+                .ok_or("Target lacks a pinned checkpoint identity")?,
+            verify,
+        )?);
+        self.confidence = confidence;
+        Ok(())
+    }
+    fn independent_draft(&self) -> bool {
+        self.external_draft.is_some() || self.block_draft.is_some()
+    }
+    pub(crate) fn attach_draft(&mut self, draft: Self) -> Result<()> {
+        if self.manifest.mtp.is_none() || draft.manifest.vocab != self.manifest.vocab {
+            return Err(
+                "Draft requires compatible output vocabularies and a target verifier".into(),
+            );
+        }
+        self.effective_context = self.effective_context.min(draft.effective_context);
+        self.external_draft = Some(Box::new(draft));
+        Ok(())
     }
     fn prepare_inputs(&self, tokens: &[u32], history: &[u32]) -> Result<()> {
         self.prepare_program_inputs("target", tokens, history)

@@ -44,6 +44,9 @@ pub struct RequestState {
     lookup_costs: BTreeMap<usize, speculation::Profile>,
     prompt_lookup: prompt_lookup::PromptLookup,
     mtp_blocked: bool,
+    pub(super) features: Option<super::block_draft::FeatureHistory>,
+    external_allowed: bool,
+    external_state: Option<Box<RequestState>>,
     draft_acceptance: speculation::control::Acceptance,
     pending_audio: Vec<crate::audio::AudioInput>,
 }
@@ -126,7 +129,7 @@ impl ModelRuntime {
             .ok_or("Context budget overflow")?;
         if input.input_tokens.is_empty()
             || input.max_new_tokens == 0
-            || context > self.manifest.max_context
+            || context > self.effective_context
             || input
                 .input_tokens
                 .iter()
@@ -137,7 +140,7 @@ impl ModelRuntime {
         input.sampling.validate()?;
         Ok(context)
     }
-    fn request_limits(
+    pub(super) fn request_limits(
         &self,
         input: &GenerationInput,
         context: usize,
@@ -374,8 +377,38 @@ impl ModelRuntime {
         }
         let context = self.validate_generation(input)?;
         let limits = self.request_limits(input, context)?;
-        let mut fixed = self.execution.additional_state_bytes(&limits)?;
-        let mut prospective = self.execution.additional_kv_bytes(context, &limits)?;
+        let (draft_fixed, draft_kv, draft_workspace) = if let Some(draft) = &self.external_draft {
+            let draft_input = GenerationInput {
+                input_tokens: vec![],
+                images: vec![],
+                audios: vec![],
+                max_new_tokens: 1,
+                sampling: Default::default(),
+                prefix_hints: vec![],
+            };
+            let limits = draft.request_limits(&draft_input, context)?;
+            (
+                draft.execution.additional_state_bytes(&limits)?,
+                draft.execution.reserved_kv_bytes(context)?,
+                draft.pending_workspace(context, 0, &["decode", "prefill", "head"])?,
+            )
+        } else if let Some(block) = &self.block_draft {
+            (
+                self.execution.request_fixed_bytes(&limits)?,
+                self.execution.reserved_kv_bytes(context)?,
+                block.temporary_bytes(context)?,
+            )
+        } else {
+            (0, 0, 0)
+        };
+        let mut fixed = self
+            .execution
+            .additional_state_bytes(&limits)?
+            .saturating_add(draft_fixed);
+        let mut prospective = self
+            .execution
+            .additional_kv_bytes(context, &limits)?
+            .saturating_add(draft_kv);
         let sampling = input.sampling.temperature > 0. && input.sampling.top_logprobs.is_none();
         let mut programs = vec!["decode", "prefill", "head"];
         if !input.images.is_empty()
@@ -386,16 +419,50 @@ impl ModelRuntime {
         if !input.audios.is_empty() {
             programs.extend(["audio_stem", "audio_encoder"]);
         }
-        let workspace = self.pending_workspace(context, sampling, &programs)?;
+        let workspace = self
+            .pending_workspace(context, usize::from(sampling), &programs)?
+            .saturating_add(draft_workspace);
         let future = self
             .reserved_requests
             .values()
             .map(|r| r.kv_bytes as u128)
             .sum::<u128>()
-            .saturating_sub(self.execution.active_kv_bytes() as u128);
-        let base = future + workspace as u128 + options.memory_reserve_bytes as u128;
+            .saturating_sub(self.active_worker_kv() as u128);
+        let pooled = self.execution.pool_free_bytes().is_some();
+        if pooled {
+            while (self.execution.pool_free_bytes().unwrap_or(0) as u128)
+                < future + prospective as u128
+            {
+                self.execution.reclaim_idle_state()?;
+                prospective = self
+                    .execution
+                    .additional_kv_bytes(context, &limits)?
+                    .saturating_add(draft_kv);
+                fixed = self
+                    .execution
+                    .additional_state_bytes(&limits)?
+                    .saturating_add(draft_fixed);
+                if self.execution.pool_free_bytes().unwrap_or(0) as u128
+                    >= future + prospective as u128
+                {
+                    break;
+                }
+                if !self.evict_prefix(None)? {
+                    return self.defer_memory_admission(
+                        fixed,
+                        fixed,
+                        prospective,
+                        future as usize,
+                        workspace,
+                    );
+                }
+            }
+        }
+        let base = (if pooled { 0 } else { future })
+            + workspace as u128
+            + options.memory_reserve_bytes as u128;
         let needed_bytes = |fixed: usize, prospective: usize| {
-            usize::try_from(base + fixed as u128 + prospective as u128)
+            usize::try_from(base + fixed as u128 + if pooled { 0 } else { prospective as u128 })
                 .map_err(|_| "Admission budget overflow")
         };
         let mut needed = needed_bytes(fixed, prospective)?;
@@ -408,8 +475,14 @@ impl ModelRuntime {
         }
         if self.admission_free_bytes()? < needed {
             self.execution.reclaim_idle_state()?;
-            prospective = self.execution.additional_kv_bytes(context, &limits)?;
-            fixed = self.execution.additional_state_bytes(&limits)?;
+            prospective = self
+                .execution
+                .additional_kv_bytes(context, &limits)?
+                .saturating_add(draft_kv);
+            fixed = self
+                .execution
+                .additional_state_bytes(&limits)?
+                .saturating_add(draft_fixed);
             needed = needed_bytes(fixed, prospective)?;
         }
         if self
@@ -426,7 +499,12 @@ impl ModelRuntime {
                 return self.defer_memory_admission(needed, fixed, prospective, future, workspace);
             }
         }
-        self.trim_request_cache(options, fixed + prospective, context, sampling)?;
+        self.trim_request_cache(
+            options,
+            fixed + if pooled { 0 } else { prospective },
+            context,
+            sampling,
+        )?;
         self.idle_admission_since = None;
         Ok(true)
     }
@@ -470,10 +548,10 @@ impl ModelRuntime {
             .free_bytes()?
             .min(scheduler::usable_host_bytes()?))
     }
-    fn pending_workspace(
+    pub(super) fn pending_workspace(
         &self,
         context: usize,
-        additional_sampler: bool,
+        additional_samplers: usize,
         programs: &[&str],
     ) -> Result<usize> {
         // Media encoding can wait behind text packets. Retain its shared
@@ -506,7 +584,7 @@ impl ModelRuntime {
             .values()
             .filter(|r| r.sampling)
             .count()
-            + usize::from(additional_sampler);
+            + additional_samplers;
         if samplers > 0
             && let Some(sampling) = &self.manifest.sampling
         {
@@ -529,6 +607,13 @@ impl ModelRuntime {
         }
         Ok(bytes)
     }
+    fn active_worker_kv(&self) -> usize {
+        self.execution.active_kv_bytes().saturating_add(
+            self.external_draft
+                .as_deref()
+                .map_or(0, |d| d.execution.active_kv_bytes()),
+        )
+    }
     fn trim_request_cache(
         &mut self,
         options: &scheduler::Options,
@@ -536,15 +621,19 @@ impl ModelRuntime {
         context: usize,
         additional_sampler: bool,
     ) -> Result<()> {
-        let future = self
-            .reserved_requests
-            .values()
-            .map(|r| r.kv_bytes)
-            .sum::<usize>()
-            .saturating_sub(self.execution.active_kv_bytes())
+        let unallocated_kv = if self.execution.pool_free_bytes().is_some() {
+            0
+        } else {
+            self.reserved_requests
+                .values()
+                .map(|r| r.kv_bytes)
+                .sum::<usize>()
+                .saturating_sub(self.active_worker_kv())
+        };
+        let future = unallocated_kv
             .checked_add(self.pending_workspace(
                 context,
-                additional_sampler,
+                usize::from(additional_sampler),
                 &["decode", "prefill", "head"],
             )?)
             .ok_or("Future workspace budget overflow")?;
@@ -674,7 +763,15 @@ impl ModelRuntime {
             self.reserved_requests.insert(
                 slot,
                 Reservation {
-                    kv_bytes: self.execution.reserved_kv_bytes(context)?,
+                    kv_bytes: self
+                        .execution
+                        .reserved_kv_bytes(context)?
+                        .saturating_mul(1 + usize::from(self.block_draft.is_some()))
+                        .saturating_add(
+                            self.external_draft
+                                .as_deref()
+                                .map_or(Ok(0), |d| d.execution.reserved_kv_bytes(context))?,
+                        ),
                     context,
                     sampling: input.sampling.temperature > 0.
                         && input.sampling.top_logprobs.is_none(),
@@ -707,6 +804,9 @@ impl ModelRuntime {
                 lookup_costs: Default::default(),
                 prompt_lookup: Default::default(),
                 mtp_blocked: false,
+                features: None,
+                external_allowed: image_work == 0,
+                external_state: None,
                 draft_acceptance: Default::default(),
                 pending_audio: if offset < prompt_len {
                     input.audios
@@ -1654,9 +1754,34 @@ impl ModelRuntime {
         };
         // Prompt lookup remains an explicitly enabled proposal source. Its
         // timing/acceptance never trains the model-draft controller.
+        if decode_round && requests.len() == 1 && decode.len() == 1 && self.independent_draft() {
+            let i = decode[0];
+            let req = &requests[i];
+            if req.external_allowed
+                && req.sampling.is_greedy()
+                && req.sampling.top_logprobs.is_none()
+                && !req.decoder.constrained()
+                && let Some(spec) = self.manifest.mtp.as_ref()
+                && let Some(plan) = spec.best_verification_plan(
+                    (req.limit - req.generated)
+                        .min(spec.default_verification_tokens)
+                        .min(if options.max_speculative_tokens == 0 {
+                            usize::MAX
+                        } else {
+                            options.max_speculative_tokens
+                        }),
+                )
+            {
+                return Ok(Work::Speculative(i, plan.tokens));
+            }
+        }
         if decode_round && decode.len() == 1 && self.prompt_lookup {
             let i = decode[0];
             if let Some(spec) = &self.manifest.mtp {
+                let req = &mut requests[i];
+                if self.lookup_only {
+                    req.prompt_lookup.index_history(&req.core.history);
+                }
                 let req = &requests[i];
                 if req.sampling.is_greedy()
                     && req.sampling.top_logprobs.is_none()
@@ -2423,6 +2548,14 @@ impl ModelRuntime {
             }
             Ok(())
         });
+        if let Some(mut features) = req.features.take() {
+            features.release(self)?;
+        }
+        if let (Some(draft), Some(mut state)) =
+            (&mut self.external_draft, req.external_state.take())
+        {
+            draft.finish_request(&mut state, false)?;
+        }
         self.release_prefill_frame(req)?;
         self.execution
             .release_sequence(req.slot, &self.manifest.reset_buffers)?;

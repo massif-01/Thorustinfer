@@ -126,6 +126,7 @@ pub struct RunReport {
 // Raw handles make this private owner !Send/!Sync. No CUDA context or allocation
 // is borrowed by outside code, and all resources belong to the retained context.
 pub(crate) struct Session {
+    pub(super) kv_pool: Option<std::rc::Rc<virtual_memory::PagePool>>,
     pub(crate) owner: thorustinfer_device::DeviceOwner,
     pub(crate) driver: Driver,
     pub(crate) device: i32,
@@ -152,6 +153,7 @@ pub(crate) struct Session {
 impl Session {
     pub(crate) fn new(driver: Driver) -> Self {
         Self {
+            kv_pool: None,
             owner: thorustinfer_device::DeviceOwner::new(thorustinfer_device::Backend::Cuda, 0),
             driver,
             device: 0,
@@ -241,6 +243,9 @@ impl Session {
                     sys::cuMemAddressFree(buffer.address, buffer.bytes),
                     "free KV address reservation",
                 );
+            }
+            if let Some(pool) = self.kv_pool.take() {
+                pool.clear();
             }
             for buffer in self.buffers.drain(..) {
                 record(sys::cuMemFree_v2(buffer), "free buffer");

@@ -202,7 +202,12 @@ async fn gateway_request(
         return error(StatusCode::NOT_FOUND, format!("Unknown model: {name}"));
     };
     if let Some(native) = &native {
-        if let Err(e) = native.validate(&record) {
+        if record.options.context_options.context
+            != Some(thorustinfer_engine::execution::ContextLimit::Auto)
+            && record.options.context_options.kv_cache_mib.is_none()
+            && record.options.context_options.context_concurrency.is_none()
+            && let Err(e) = native.validate(record.max_context)
+        {
             return error(StatusCode::BAD_REQUEST, e);
         }
         if native.empty && native.keep_alive == Some(0) {
@@ -217,11 +222,15 @@ async fn gateway_request(
             };
         }
     }
-    let (mut lease, record) = match manager.acquire(&name).await {
+    let (mut lease, mut record) = match manager.acquire(&name).await {
         Ok(value) => value,
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, e),
     };
+    record.max_context = lease.0.effective_context.load(Ordering::Acquire);
     if let Some(native) = &native {
+        if let Err(e) = native.validate(lease.0.effective_context.load(Ordering::Acquire)) {
+            return error(StatusCode::BAD_REQUEST, e);
+        }
         // An omitted keep_alive resets the TTL to the deployment default, just
         // as a subsequent Ollama request supersedes a previous keep_alive:0.
         lease.0.keep_alive_s.store(
@@ -583,6 +592,9 @@ async fn batch(State(manager): State<Arc<Manager>>, Json(input): Json<Batch>) ->
             child: Mutex::new(child),
             client: reqwest::Client::new(),
             active: AtomicUsize::new(1),
+            effective_context: AtomicUsize::new(record.max_context),
+            plans_capacity: record.options.context_options.plans_capacity(),
+            planned_growth: AtomicUsize::new(0),
             last_used: SyncMutex::new(Instant::now()),
             keep_alive_s: AtomicU64::new(0),
             draining: AtomicBool::new(false),

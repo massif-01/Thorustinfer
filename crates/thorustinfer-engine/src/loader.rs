@@ -42,6 +42,9 @@ pub(crate) struct PreparedModel {
     pub execution_package: String,
     pub architecture: Architecture,
     pub policy: ComputePolicy,
+    pub checkpoint: Option<(String, String)>,
+    pub target_verification: bool,
+    pub native_mtp: bool,
     pub frontend_assets: BTreeMap<String, String>,
     pub expert_banks: Vec<thorustinfer_model_sdk::architecture::ExpertBank>,
     pub execution_model: Box<dyn thorustinfer_models::Adapter>,
@@ -99,6 +102,11 @@ fn load_impl(
     let config_raw = fs::read(config_path).map_err(|e| e.to_string())?;
     let config: serde_json::Value =
         serde_json::from_slice(&config_raw).map_err(|e| e.to_string())?;
+    let quant = &config["quantization_config"];
+    let checkpoint = quant["source"]
+        .as_str()
+        .zip(quant["source_revision"].as_str())
+        .map(|(repo, revision)| (repo.to_owned(), revision.to_owned()));
     let kernel_root = operators::resolve(&weights_root, &model.execution_package)?;
     let package_raw =
         fs::read(resolve_file(&kernel_root, "package.json")?).map_err(|e| e.to_string())?;
@@ -166,7 +174,25 @@ fn load_impl(
     // The declared package identity pins the compiled plan and config signature.
     // Loading consumes that identity; validate-model verifies its contents.
     let fingerprint = model.execution_package.clone();
+    let native = model.metadata.mtp.as_ref();
+    let w4a4 = model.compute_policy == "nvfp4_ffn";
+    let target_verification = native.is_some_and(|spec| !spec.verification_plans.is_empty())
+        && (!w4a4
+            || package
+                .toolchain
+                .get("target_verification")
+                .is_some_and(|v| v == "qwen_rows"));
+    let native_mtp = native
+        .is_some_and(|spec| model.metadata.programs.contains_key(&spec.draft_program))
+        && (!w4a4
+            || package
+                .toolchain
+                .get("native_draft")
+                .is_some_and(|v| v == "mtp"));
     Ok(PreparedModel {
+        checkpoint,
+        target_verification,
+        native_mtp,
         plan: model.metadata,
         weights_root,
         kernel_root,

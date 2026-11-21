@@ -35,6 +35,9 @@ impl std::fmt::Display for BatchOrder {
 /// File-based Chat inference. Execution and protocol semantics match `serve`.
 #[derive(Clone, Debug)]
 pub struct BatchConfig {
+    pub draft_confidence: Option<f32>,
+    pub draft_model: Option<PathBuf>,
+    pub context_options: thorustinfer_engine::execution::ContextOptions,
     pub model_dir: PathBuf,
     pub model: String,
     pub input: PathBuf,
@@ -50,6 +53,9 @@ pub struct BatchConfig {
 impl BatchConfig {
     pub(crate) fn settings(&self) -> ServerConfig {
         ServerConfig {
+            draft_confidence: self.draft_confidence,
+            draft_model: self.draft_model.clone(),
+            context_options: self.context_options,
             model_dir: self.model_dir.clone(),
             model: self.model.clone(),
             default_request_params: self.default_request_params.clone(),
@@ -59,6 +65,7 @@ impl BatchConfig {
             load_workers: self.load.load_workers,
             resident_experts: self.load.resident_experts,
             mtp_drafts: self.load.mtp_drafts,
+            spec_method: self.load.spec_method,
             prompt_lookup: self.load.prompt_lookup,
             prefix_cache_bytes: self.load.prefix_cache_bytes,
             kv_offload_bytes: self.load.kv_offload_bytes,
@@ -71,6 +78,9 @@ impl BatchConfig {
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
+    pub draft_confidence: Option<f32>,
+    pub draft_model: Option<PathBuf>,
+    pub context_options: thorustinfer_engine::execution::ContextOptions,
     pub model_dir: PathBuf,
     pub model: String,
     pub listen: String,
@@ -82,6 +92,7 @@ pub struct ServerConfig {
     pub load_workers: Option<usize>,
     pub resident_experts: ResidentExperts,
     pub mtp_drafts: Option<usize>,
+    pub spec_method: Option<thorustinfer_engine::execution::SpecMethod>,
     pub prompt_lookup: bool,
     pub prefix_cache_bytes: usize,
     pub kv_offload_bytes: usize,
@@ -91,6 +102,9 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            draft_confidence: None,
+            draft_model: None,
+            context_options: Default::default(),
             model_dir: PathBuf::new(),
             model: "local-model".into(),
             listen: "[::]:8088".into(),
@@ -101,6 +115,7 @@ impl Default for ServerConfig {
             load_workers: None,
             resident_experts: ResidentExperts::default(),
             mtp_drafts: None,
+            spec_method: None,
             prompt_lookup: false,
             prefix_cache_bytes: 4usize << 30,
             kv_offload_bytes: 0,
@@ -121,6 +136,20 @@ impl ServerConfig {
         if self.model.is_empty() {
             return Err("Model ID cannot be empty".into());
         }
+        if self.draft_confidence.is_some_and(|v| {
+            !(0.0..=1.0).contains(&v)
+                || self.spec_method != Some(thorustinfer_engine::execution::SpecMethod::Dspark)
+        }) {
+            return Err("draft-confidence requires dspark and a finite threshold in [0,1]".into());
+        }
+        if self.spec_method.is_some_and(|m| m.uses_draft_model()) != self.draft_model.is_some() {
+            return Err(
+                "Independent and block draft methods require one draft-model directory".into(),
+            );
+        }
+        if self.spec_method.is_some() && (self.prompt_lookup || self.mtp_drafts.is_some()) {
+            return Err("spec-method conflicts with explicit mtp-drafts or prompt-lookup".into());
+        }
         if self.mtp_drafts.is_some_and(|n| n > MAX_MTP_DRAFTS) {
             return Err("MTP drafts must be auto or 0..31".into());
         }
@@ -135,6 +164,14 @@ impl ServerConfig {
             || self.limits.drain_ms == 0
         {
             return Err("Invalid preprocessing or timeout limits".into());
+        }
+        self.context_options.kv_bytes()?;
+        if self
+            .context_options
+            .context_concurrency
+            .is_some_and(|n| n.get() > self.scheduler.max_active)
+        {
+            return Err("context-concurrency exceeds max-active-requests".into());
         }
         self.scheduler.validate()
     }

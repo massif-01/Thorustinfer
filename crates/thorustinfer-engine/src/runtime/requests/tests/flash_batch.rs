@@ -579,7 +579,7 @@ fn validate_flash_decode_batches() {
                     model
                         .pending_workspace(
                             context,
-                            item.sampling.temperature > 0.,
+                            usize::from(item.sampling.temperature > 0.),
                             &["decode", "prefill", "head"]
                         )
                         .unwrap()

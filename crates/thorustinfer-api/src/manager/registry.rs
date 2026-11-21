@@ -27,6 +27,29 @@ pub struct ModelRecord {
     pub options: WorkerOptions,
 }
 
+impl ModelRecord {
+    pub(super) fn start_bytes(&self) -> Result<usize> {
+        self.load_bytes
+            .checked_add(self.options.context_options.kv_bytes()?)
+            .ok_or("Model load budget overflow".into())
+    }
+}
+
+pub(super) fn model_identity(target: &[u8], options: &WorkerOptions) -> Result<String> {
+    let id = sha256(target);
+    let Some(path) = &options.draft_model else {
+        return Ok(id);
+    };
+    let descriptor =
+        if options.spec_method == Some(thorustinfer_engine::execution::SpecMethod::Draft) {
+            "cache/model.json"
+        } else {
+            "draft.json"
+        };
+    let data = fs::read(path.join(descriptor)).map_err(|e| e.to_string())?;
+    Ok(sha256(format!("{id}:{}", sha256(&data)).as_bytes()))
+}
+
 pub fn inspect(name: &str, path: &Path, options: WorkerOptions) -> Result<ModelRecord> {
     validate_name(name)?;
     let path = path.canonicalize().map_err(|e| e.to_string())?;
@@ -65,7 +88,7 @@ pub fn inspect(name: &str, path: &Path, options: WorkerOptions) -> Result<ModelR
             }
         }
     }
-    let kv_bytes_per_token = plan
+    let mut kv_bytes_per_token = plan
         .manifest
         .kv_cache
         .as_ref()
@@ -76,15 +99,45 @@ pub fn inspect(name: &str, path: &Path, options: WorkerOptions) -> Result<ModelR
         })
         .transpose()?
         .unwrap_or(0);
+    let mut max_context = plan.manifest.max_context;
+    let identity = model_identity(&raw, &options)?;
+    if let Some(draft) = &options.draft_model {
+        let requested =
+            if options.spec_method == Some(thorustinfer_engine::execution::SpecMethod::Draft) {
+                let other = inspect(name, draft, WorkerOptions::default())?;
+                max_context = max_context.min(other.max_context);
+                sequence_bytes = sequence_bytes.saturating_add(other.sequence_bytes);
+                kv_bytes_per_token = kv_bytes_per_token.saturating_add(other.kv_bytes_per_token);
+                other.load_bytes
+            } else {
+                let bytes = std::fs::metadata(draft.join("model.safetensors"))
+                    .map_err(|e| e.to_string())?
+                    .len();
+                usize::try_from(bytes).map_err(|_| "Draft weights exceed addressable memory")?
+            };
+        load_bytes = load_bytes
+            .checked_add(requested)
+            .ok_or("Draft load budget overflow")?;
+    }
+    if let Some(thorustinfer_engine::execution::ContextLimit::Tokens(n)) =
+        options.context_options.context
+    {
+        if n.get() > max_context {
+            return Err(format!(
+                "Requested context exceeds package limit {max_context}"
+            ));
+        }
+        max_context = n.get();
+    }
     Ok(ModelRecord {
         name: name.into(),
         path,
-        identity: sha256(&raw),
+        identity,
         architecture: plan.architecture.to_string(),
         execution_package: plan.execution_package,
         weight_bytes: plan.manifest.weight_bytes,
         load_bytes,
-        max_context: plan.manifest.max_context,
+        max_context,
         sequence_bytes,
         kv_bytes_per_token,
         options,

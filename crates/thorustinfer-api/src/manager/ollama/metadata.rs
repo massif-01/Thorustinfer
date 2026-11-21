@@ -144,7 +144,7 @@ pub(super) async fn ps(State(manager): State<Arc<Manager>>, headers: HeaderMap) 
             .filter(|time| keep_alive != u64::MAX && *time <= UNIX_EPOCH + Duration::from_secs(253402300799))
             .map(response::timestamp).unwrap_or_else(|| "9999-12-31T23:59:59Z".into());
         Some(json!({"name":runner.model,"model":runner.model,"size":record.weight_bytes,"digest":record.identity,
-            "details":details(record),"expires_at":expires,"context_length":record.max_context,
+            "details":details(record),"expires_at":expires,"context_length":runner.effective_context.load(Ordering::Acquire),
             "estimated_load_bytes":record.load_bytes,"active_requests":runner.active.load(Ordering::Acquire)}))
     }).collect();
     Json(json!({"models":models})).into_response()

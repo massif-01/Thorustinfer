@@ -96,3 +96,39 @@ In the Thor port benchmark, a 2,048-token prompt and 48-token response took **2.
 [Serving and clients](docs/serving.md) · [Model package format](docs/model-packages.md) · [Building from source](tools/thor/BUILD.md) · [OpenCode example](examples/opencode.json) · [Pi example](examples/pi-models.json)
 
 [External agent benchmarks](https://github.com/massif-01/Thorustinfer-benchmarks) · [DeepSeek model reference](reference/deepseek-v41/README.md)
+
+## Worker context and KV memory
+
+`--context N` limits the total prompt and output tokens for each request. To size the limit from available memory after loading the model, use `--context auto`. With all three options omitted, the worker uses the package context and maps KV pages on demand.
+
+| Option | Effect |
+| --- | --- |
+| `--kv-cache-mib B` | Preallocate B MiB for private device KV and shared prefix pages. The worker rounds down to the CUDA page size. Used alone, this option selects automatic context sizing. |
+| `--context N\|auto` | Choose an explicit per-request limit or the largest length that fits the package, physical memory and KV budget. An infeasible explicit setting fails at startup. |
+| `--context-concurrency C` | Plan for C simultaneous maximum-length requests. The default is one. C must fit within `--max-active-requests`. Shorter requests can still share the remaining capacity. |
+
+The direct server, registered model workers and offline batch accept the same settings. The manager serializes capacity planning with other worker starts. A ready worker reports its planned on-demand growth separately from its physical pool. Later workers subtract that headroom when sizing their own context. Read `context_plan` from a worker's `/health` for the package limit, effective limit, planning concurrency, requested pool size, aligned pool size and live pool occupancy in bytes. `--prefix-cache-mib` controls snapshot retention and `--memory-reserve-mib` sets aside system memory.
+
+## Speculative decoding
+
+The W4A4 verifier package accepts native MTP, greedy prompt lookup and separate draft models. The original W4A4 package serves ordinary decoding. W4A4 defaults to ordinary decoding. Existing E8P installations retain their package default.
+
+| `--spec-method` | Proposal source |
+| --- | --- |
+| `none` | Ordinary target decoding. |
+| `mtp` | The execution package's native MTP head. Supports greedy and rejection sampling. |
+| `prompt-lookup` | Copies a repeated continuation from this request. A miss uses ordinary decoding. |
+| `draft` | A separately prepared small model with matching tokenizer and special token IDs. |
+| `dflash`, `dflash2`, `dspark` | A checkpoint paired to the target revision. The block drafter reads intermediate target layers. DFlash2 uses its trained convolution and candidate selector. DSpark uses its Markov head and optionally its confidence head. |
+
+For example, start an independent text draft with both installed model directories.
+
+```sh
+thorustinfer serve "$TARGET_MODEL" --spec-method draft --draft-model "$SMALL_MODEL"
+```
+
+The three block methods use the same `--draft-model` option. With DSpark, add `--draft-confidence P` to shorten the block when trained confidence falls below P (0 to 1). Omitting it uses a fixed proposal length within the verifier's supported width. Prepare a block package offline with `python -m thorustinfer_build.models.block_draft.build --source CHECKPOINT --target-model TARGET --output PACKAGE --cache BUILD_CACHE` in the CUDA build environment.
+
+Prompt lookup and the separate draft methods propose for one text request with unpenalized greedy sampling. Set `temperature`, `presence_penalty` and `frequency_penalty` to 0 and `repetition_penalty` to 1. Other sampling settings use the target decoder. The independent and block methods also use ordinary decoding while multiple requests are active or a token mask is required. Only verified tokens reach the stream. Requests with a prefix hit rebuild missing draft state from committed tokens. Each worker loads its draft from a local directory.
+
+Use `--spec-method` by itself or use the original `--mtp-drafts` and `--prompt-lookup` controls. The original lookup flag allows MTP proposals on misses. The worker's `/health` reports the selected method and verifier width. The request completion log reports proposals, acceptances and verification time.

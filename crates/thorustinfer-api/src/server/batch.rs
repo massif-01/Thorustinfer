@@ -45,10 +45,30 @@ pub fn run(config: BatchConfig) -> Result<BatchReport> {
         .map_err(|e| format!("Read model identity: {e}"))?;
     // Version the resolved model-default policy as well as explicit overrides.
     // Old journals must not mix prior defaults with newly prepared requests.
-    let identity = json!({"schema":2,"input_sha256":input.sha256,
+    let mut identity = json!({"schema":2,"input_sha256":input.sha256,
         "model_sha256":thorustinfer_engine::artifact::sha256(&descriptor),"model":config.model,
         "default_request_params":defaults,"mtp_drafts":config.load.mtp_drafts,
         "prompt_lookup":config.load.prompt_lookup});
+    if config.context_options.context.is_some()
+        || config.context_options.kv_cache_mib.is_some()
+        || config.context_options.context_concurrency.is_some()
+    {
+        identity["context_options"] = json!(config.context_options);
+    }
+    if let Some(method) = config.load.spec_method {
+        identity["spec_method"] = json!(method);
+    }
+    if let Some(draft) = &config.draft_model {
+        let manifest =
+            if config.load.spec_method == Some(thorustinfer_engine::execution::SpecMethod::Draft) {
+                "cache/model.json"
+            } else {
+                "draft.json"
+            };
+        let descriptor = std::fs::read(draft.join(manifest)).map_err(|e| e.to_string())?;
+        identity["draft_sha256"] = json!(thorustinfer_engine::artifact::sha256(&descriptor));
+        identity["draft_confidence"] = json!(config.draft_confidence);
+    }
     let mut journal = Journal::open(&config.output, config.resume, &identity, &input)?;
     let mut report = BatchReport {
         scheduler_policy: config.scheduler.policy,

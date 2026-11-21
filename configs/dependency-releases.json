@@ -8,7 +8,7 @@
     "crates/thorustinfer-api/Cargo.toml": "deca6d61a00fa75fd0c834cce7fb61295f1a60e05515314d3a9cf8f6ee154a77",
     "crates/thorustinfer-cli/Cargo.toml": "ecb16606fb797fbdc38e721c4f53f8a5f35aa6f20ca7524a458e23abd15b0cba",
     "crates/thorustinfer-device/Cargo.toml": "d2195d4665f86847f3f3320acb6a2621a50013f13910fffbf0875d81eac52627",
-    "crates/thorustinfer-engine/Cargo.toml": "a77ca8499163d93e3e818ec4e6a4391a25d61d13b104b882e3c1d2f2b5e02580",
+    "crates/thorustinfer-engine/Cargo.toml": "1c85dad0a76b0d101837e165ede53d7c26d2f525c3722a988a2671db40d03321",
     "crates/thorustinfer-model-sdk/Cargo.toml": "a91932de62c4a7bae3f7f4b0320378fb205084f92995a559d9342f46be8264d5",
     "crates/thorustinfer-models/Cargo.toml": "117a99c0935c02d336a2a7ab487b880234830cd1476484aebaafbb8deec6b0d4",
     "pyproject.toml": "b08594d0bd11ed8b17591d7e265b8f2bf2638f0e1863473d2b7c80e00b31ec5e",
