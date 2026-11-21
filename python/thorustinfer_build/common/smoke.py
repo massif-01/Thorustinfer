@@ -1,5 +1,6 @@
 """Compile/export a production norm and verify changed-input CUDA graph replay in a fresh cache."""
 
+from thorustinfer_build.compiler.cuda import target as cuda_target
 import argparse
 from pathlib import Path
 import torch
@@ -14,9 +15,7 @@ from thorustinfer_build.compiler.cuda.common import configure, export_kernel, wr
 def dynamic_greedy(output):
     """One cubin must honor actual rows, affine shapes, tails and graph inputs."""
     fn = explicit_rows(greedy_merge.__wrapped__(2049, rows=8, dynamic_rows=True))
-    kernel = tilelang.compile(
-        fn, out_idx=[], execution_backend="nvrtc", target={"kind": "cuda", "arch": "sm_87"}
-    )
+    kernel = tilelang.compile(fn, out_idx=[], execution_backend="nvrtc", **cuda_target.options())
     export_kernel(kernel, output)
     (host,) = parse_host((output / "host.txt").read_text())
     validate_parameter_count((output / "kernel.cu").read_text(), host)

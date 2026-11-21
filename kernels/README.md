@@ -1,9 +1,9 @@
 # TileLang kernels
 
-生产算子按后端组织：`cuda/` 面向 CUDA SM87，`ascend/` 面向 Ascend 910B / CANN 9.2，
+生产算子位于 `cuda/`，Thor 使用 CUDA SM110a，
 `shared/` 保存两个编译前端复用的动态行契约。CUDA 的基础算子、模型计算、音频和视觉
 分别位于 `cuda/operators`、`cuda/model`、`cuda/audio`、`cuda/vision`。
-设备验证程序位于 `tests/cuda` 与 `tests/ascend`，编译和调优实现位于 `python/thorustinfer_build`。
+设备验证程序位于 `tests/cuda`，编译和调优实现位于 `python/thorustinfer_build`。
 
 kernel 经离线编译生成 cubin 和真实 host ABI，在线由 Rust CUDA Driver 执行。导出格式与模型组装入口见[模型工具](../tools/model/README.md)。新增实现应检查完整数值、非对齐尾部、状态语义和改变输入后的 graph replay。
 

@@ -42,7 +42,7 @@ async fn transcriptions(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    gateway_request(manager, headers, body, None, true, None).await
+    gateway_request(manager, headers, body, None, true, None, None).await
 }
 async fn render(State(manager): State<Arc<Manager>>, headers: HeaderMap, body: Body) -> Response {
     gateway_request(
@@ -52,6 +52,7 @@ async fn render(State(manager): State<Arc<Manager>>, headers: HeaderMap, body: B
         None,
         false,
         Some("/v1/chat/completions/render"),
+        None,
     )
     .await
 }
@@ -61,11 +62,29 @@ async fn embeddings(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    gateway_request(manager, headers, body, None, false, Some("/v1/embeddings")).await
+    gateway_request(
+        manager,
+        headers,
+        body,
+        None,
+        false,
+        Some("/v1/embeddings"),
+        None,
+    )
+    .await
 }
 
 async fn rerank(State(manager): State<Arc<Manager>>, headers: HeaderMap, body: Body) -> Response {
-    gateway_request(manager, headers, body, None, false, Some("/v1/rerank")).await
+    gateway_request(
+        manager,
+        headers,
+        body,
+        None,
+        false,
+        Some("/v1/rerank"),
+        None,
+    )
+    .await
 }
 
 pub(super) async fn gateway(
@@ -74,7 +93,16 @@ pub(super) async fn gateway(
     body: Body,
     protocol: Option<ollama::Kind>,
 ) -> Response {
-    gateway_request(manager, headers, body, protocol, false, None).await
+    gateway_request(manager, headers, body, protocol, false, None, None).await
+}
+
+pub(crate) async fn wire_gateway(
+    manager: Arc<Manager>,
+    headers: HeaderMap,
+    body: Body,
+    kind: crate::server::wire::Kind,
+) -> Response {
+    gateway_request(manager, headers, body, None, false, None, Some(kind)).await
 }
 
 async fn gateway_request(
@@ -84,15 +112,22 @@ async fn gateway_request(
     protocol: Option<ollama::Kind>,
     transcription: bool,
     scoring: Option<&str>,
+    wire: Option<crate::server::wire::Kind>,
 ) -> Response {
     if !authorized(&headers) {
         return error(StatusCode::UNAUTHORIZED, "Invalid API key");
     }
-    let Ok(slot) = Arc::clone(&manager.requests).try_acquire_owned() else {
-        return error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Global request queue is full",
-        );
+    let counting = wire == Some(crate::server::wire::Kind::Count);
+    let slot = if counting {
+        None
+    } else {
+        let Ok(slot) = Arc::clone(&manager.requests).try_acquire_owned() else {
+            return error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Global request queue is full",
+            );
+        };
+        Some(slot)
     };
     let body_mib = manager.config.worker_options.request_body_mib;
     let reserve = (body_mib * if transcription { 4 } else { 3 }) as u32;
@@ -130,6 +165,17 @@ async fn gateway_request(
             Ok(value) => (value, None),
             Err(e) => return error(StatusCode::BAD_REQUEST, e.to_string()),
         }
+    };
+    let wire = if let Some(kind) = wire {
+        match crate::server::wire::translate(kind, request) {
+            Ok((chat, context)) => {
+                request = chat;
+                Some(context)
+            }
+            Err(e) => return error(StatusCode::BAD_REQUEST, e),
+        }
+    } else {
+        None
     };
     let native = if let Some(kind) = protocol {
         match ollama::request::translate(&request, kind) {
@@ -199,7 +245,7 @@ async fn gateway_request(
     }
     request["model"] = json!(lease.0.model);
     let started = Instant::now();
-    if scoring != Some("/v1/chat/completions/render") {
+    if !counting && scoring != Some("/v1/chat/completions/render") {
         loop {
             match manager
                 .reserve_request_with_eviction(&record, &request, input_bytes)
@@ -221,13 +267,20 @@ async fn gateway_request(
             }
         }
     }
+    let path = if let Some(w) = wire {
+        request = json!([request, w]);
+        if counting {
+            "/internal/count"
+        } else {
+            "/internal/wire"
+        }
+    } else {
+        scoring.unwrap_or("/v1/chat/completions")
+    };
     let mut upstream = lease
         .0
         .client
-        .post(format!(
-            "http://localhost{}",
-            scoring.unwrap_or("/v1/chat/completions")
-        ))
+        .post(format!("http://localhost{}", path))
         .json(&request);
     for key in ["authorization", "x-request-id"] {
         if let Some(value) = headers.get(key) {
@@ -590,6 +643,7 @@ pub(super) fn public_router(manager: Arc<Manager>) -> Router {
         .route("/rerank", post(rerank))
         .route("/v1/audio/transcriptions", post(transcriptions))
         .merge(ollama::router())
+        .merge(crate::server::wire::manager_routes())
         .with_state(manager)
 }
 

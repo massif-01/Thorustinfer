@@ -6,7 +6,7 @@ CAPABILITIES = {"sm_87": (8, 7), "sm_110a": (11, 0)}
 
 
 def architecture():
-    arch = os.environ.get("THORUSTINFER_CUDA_ARCH", "sm_87")
+    arch = os.environ.get("THORUSTINFER_CUDA_ARCH", "sm_110a")
     if arch not in CAPABILITIES:
         raise ValueError(f"Unsupported thorustinfer CUDA target {arch!r}")
     return arch

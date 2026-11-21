@@ -340,7 +340,8 @@ pub fn messages_with_options(
             for part in parts.iter().filter(|p| p["type"] == "image_url") {
                 if message["role"] != "user"
                     && !(message["role"] == "tool"
-                        && spec.is_some_and(|v| v.layout == ImageLayout::DeepseekV41))
+                        && (preparation.wire_kind.is_some()
+                            || spec.is_some_and(|v| v.layout == ImageLayout::DeepseekV41)))
                 {
                     return Err("Image parts are supported in user messages".into());
                 }

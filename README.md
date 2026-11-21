@@ -2,7 +2,7 @@
 
 [English](README.md) · [中文](README.zh-CN.md)
 
-Run a local model on Jetson Thor with Thorustinfer. Connect your client using the OpenAI Chat Completions API (`POST /v1/chat/completions`), with support for streaming and model-supported tool calls. The model manager can load models on demand. On a T5000, the idle manager used 9.45 MiB of resident memory (median RSS across three starts). Inference needs additional memory for weights, caches and computation.
+Run a local model on Jetson Thor. A single HTTP address serves OpenAI Chat Completions, OpenAI Responses and Anthropic Messages. Clients can stream text, run tools locally and return their results for the next model turn. The model manager can load models on demand. On a T5000, the idle manager used 9.45 MiB of resident memory (median RSS across three starts). Inference needs additional memory for weights, caches and computation.
 
 ## Get started
 
@@ -11,8 +11,8 @@ Run a local model on Jetson Thor with Thorustinfer. Connect your client using th
 On a Jetson Thor running Linux aarch64 with a compatible NVIDIA driver, unpack the archive and run the installer. You can install and run the engine without Python or a conda environment. Use `info` to inspect the engine and `devices` to list the GPUs it can see.
 
 ```bash
-tar -xJf thorustinfer-0.1.0-linux-aarch64.tar.xz
-bash thorustinfer-0.1.0-linux-aarch64/install.sh
+tar -xJf thorustinfer-0.2.1-linux-aarch64.tar.xz
+bash thorustinfer-0.2.1-linux-aarch64/install.sh
 CLI="$HOME/.local/opt/thorustinfer/bin/thorustinfer"
 "$CLI" info
 "$CLI" devices --backend cuda
@@ -28,17 +28,62 @@ MODEL_DIR="$HOME/models/my-model"
 "$CLI" serve "$MODEL_DIR" --model local-model --listen 127.0.0.1:8088
 ```
 
-### 3. Send a request
+### 3. Connect a client
 
-When the server prints `API READY`, open another terminal. Use the name you passed to `--model` (`local-model` in this example).
+When the server prints `API READY`, open a terminal on the machine where you run your client. Set `THOR_URL` to the server address (scheme, host and port only) and `THOR_MODEL` to the name from `--model` or a registered manager alias. The example below connects from the Thor itself. For a client on another machine, bind `--listen` to the Thor’s LAN address and port in step 2, then use that address here.
+
+The default `local` is a placeholder for clients that require a key. If the server was started with `THORUSTINFER_API_KEY`, export its value as `THOR_LOCAL_KEY` on the client before running the examples.
 
 ```bash
-curl -fsS http://127.0.0.1:8088/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"local-model","messages":[{"role":"user","content":"What is 7 plus 5?"}],"temperature":0,"enable_thinking":false,"max_tokens":32}'
+THOR_URL=http://127.0.0.1:8088
+THOR_MODEL=local-model
+export THOR_LOCAL_KEY="${THOR_LOCAL_KEY:-local}"
+
+curl -fsS "$THOR_URL/v1/models" -H "Authorization: Bearer $THOR_LOCAL_KEY"
 ```
 
-Read the model's answer in the JSON field `choices[0].message.content`.
+Look for your model name in `data[].id`.
+
+#### OpenAI Chat Completions · curl
+
+```bash
+curl -fsS "$THOR_URL/v1/chat/completions" \
+  -H "Authorization: Bearer $THOR_LOCAL_KEY" -H 'Content-Type: application/json' \
+  --data-binary @- <<JSON
+{"model":"$THOR_MODEL","messages":[{"role":"user","content":"What is 7 plus 5?"}],"enable_thinking":false,"max_tokens":32}
+JSON
+```
+
+The reply is in `choices[0].message.content`.
+
+#### OpenAI Responses · Codex CLI
+
+Codex sends `POST /v1/responses` over HTTP streaming. Its provider URL includes `/v1`. This command configures one run and asks Codex to read the working directory path.
+
+```bash
+codex exec --ignore-user-config --skip-git-repo-check --sandbox read-only --model "$THOR_MODEL" \
+  -c 'model_provider="thor"' \
+  -c 'model_providers.thor.name="Thorustinfer"' \
+  -c "model_providers.thor.base_url=\"$THOR_URL/v1\"" \
+  -c 'model_providers.thor.wire_api="responses"' \
+  -c 'model_providers.thor.env_key="THOR_LOCAL_KEY"' \
+  -c 'model_providers.thor.requires_openai_auth=false' \
+  -c 'model_providers.thor.supports_websockets=false' \
+  -c 'web_search="disabled"' \
+  'Use the shell tool to print the current directory. Return the path.'
+```
+
+#### Anthropic Messages · Claude Code
+
+Claude Code adds `/v1/messages` to the server address. Run this example from a directory containing a readable `README.md`. Claude Code should read the file on your client machine and print its first heading.
+
+```bash
+ANTHROPIC_BASE_URL="$THOR_URL" ANTHROPIC_API_KEY="$THOR_LOCAL_KEY" \
+  claude --bare --model "$THOR_MODEL" --tools Read --allowedTools Read \
+  -p 'Use Read to open README.md and return its first heading.'
+```
+
+Thorustinfer also serves `POST /v1/messages/count_tokens`. Both agent protocols support client-run tools and client-supplied conversation history. For a persistent Codex provider and protocol details, see the [installation guide](tools/thor/README.md#连接-codex-和-claude-code).
 
 ## Execution and performance
 
@@ -49,3 +94,5 @@ We tested two Qwen3.5-4B profiles on the T5000. The `e8p` profile uses E8P Q4A8.
 In the Thor port benchmark, a 2,048-token prompt and 48-token response took **2.80 s with E8P** and **1.76 s with W4A4** (Qwen3.5-4B, T5000, 70 W, one request at a time, MTP off, medians after warm-up). The T4000 uses the same SM110a engine package. Hardware measurements are from the T5000.
 
 [Serving and clients](docs/serving.md) · [Model package format](docs/model-packages.md) · [Building from source](tools/thor/BUILD.md) · [OpenCode example](examples/opencode.json) · [Pi example](examples/pi-models.json)
+
+[External agent benchmarks](https://github.com/massif-01/Thorustinfer-benchmarks) · [DeepSeek model reference](reference/deepseek-v41/README.md)

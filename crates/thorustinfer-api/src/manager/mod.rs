@@ -4,7 +4,7 @@ mod ollama;
 mod options;
 mod pull;
 mod registry;
-mod routes;
+pub(crate) mod routes;
 #[cfg(test)]
 mod tests;
 
@@ -79,7 +79,7 @@ enum Acquisition {
     Ready(Lease, ModelRecord),
     Loading(Lease, ModelRecord, MemoryBudget),
 }
-struct Manager {
+pub(crate) struct Manager {
     config: ManagerConfig,
     directory: PathBuf,
     executable: PathBuf,

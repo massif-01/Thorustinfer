@@ -3,24 +3,21 @@
   "minimum_age_days": 7,
   "files": {
     ".github/workflows/check.yml": "708e463bb1cfe833fbc3060c610747ca1138ca20c2313a4838d963466219dbab",
-    "Cargo.lock": "1c62973557ae330ca07df255299fc15b05aaedf5cb66443bd20e04cf929ce9d1",
-    "Cargo.toml": "cf9b1e7ed8e94d768d9124c37f93bb0cc3244e0183a00d52c01594f31b6a66df",
+    "Cargo.lock": "e755a2e9f3af74dec818249314020dc5839008cecca6c2c41acd48e5c88d4fbe",
+    "Cargo.toml": "4fbbd0334c4e68d342c7a0dad4aff183764cc76e2693867f2d606c9963df67df",
     "crates/thorustinfer-api/Cargo.toml": "deca6d61a00fa75fd0c834cce7fb61295f1a60e05515314d3a9cf8f6ee154a77",
     "crates/thorustinfer-cli/Cargo.toml": "ecb16606fb797fbdc38e721c4f53f8a5f35aa6f20ca7524a458e23abd15b0cba",
     "crates/thorustinfer-device/Cargo.toml": "d2195d4665f86847f3f3320acb6a2621a50013f13910fffbf0875d81eac52627",
-    "crates/thorustinfer-engine/Cargo.toml": "013167f92d34bc4437ba5096df699c8e5296afbbce9e9e70e2c9993e048251ec",
+    "crates/thorustinfer-engine/Cargo.toml": "a77ca8499163d93e3e818ec4e6a4391a25d61d13b104b882e3c1d2f2b5e02580",
     "crates/thorustinfer-model-sdk/Cargo.toml": "a91932de62c4a7bae3f7f4b0320378fb205084f92995a559d9342f46be8264d5",
     "crates/thorustinfer-models/Cargo.toml": "117a99c0935c02d336a2a7ab487b880234830cd1476484aebaafbb8deec6b0d4",
-    "pyproject.toml": "b4ba571c8cff1fe33a3251b675f6f77a9b833ea49328238292c9e11ae6e94eb4",
+    "pyproject.toml": "b08594d0bd11ed8b17591d7e265b8f2bf2638f0e1863473d2b7c80e00b31ec5e",
     "rust-toolchain.toml": "7553618f800829444096beea3dce84c3d07585efda504c19adb6787369bbd9e8",
-    "tools/build/jetson_wheels.json": "435e70191f25563446812566da873e69200bd0471958b0adaa021026fc5ab4b4",
-    "tools/environments/ascend/Dockerfile": "c6a6fe85e7e96b91a970b1d55ad3b637f813d8d258b671a950f3914910a3ed01",
-    "tools/environments/ascend/run.sh": "9beda4c348fbb777cfd6d2c0a0611dbe1845168df70f01cb4e00968f084a2b9e",
-    "tools/environments/cuda/pyproject.toml": "114d14d38f1755ae0d08cdcd6589ccab37182e48fc2c0b56c0cfe5a8f3d468d5",
-    "tools/environments/cuda/uv.lock": "0a26bed5fd9fe83522f05507f417f8bf76fd274809002cdc6aca32b567843965",
+    "tools/environments/cuda/pyproject.toml": "d02a70cddb943d89694ae40eca2781c55e8ed959a03bc65a80fe4281af78a096",
+    "tools/environments/cuda/uv.lock": "944c932068d4759ff62f15b146c877df72ca13340c68e62b72ec9fb9eda7ed23",
     "tools/environments/thor/requirements.in": "39b300464f54429c7eb02c24756d0dc27fe6d5f1e361e4daaa014183ee02bcee",
     "tools/environments/thor/requirements.lock": "08582a4310e26dfca6f00a2e0a4b41805d2fc91980e0eb3cb7610b7fb584fd99",
-    "uv.lock": "f0fd3932fef4afb452d50f08cd88db5e07fd27ed55f2cda6ce0be9161e02dedf"
+    "uv.lock": "1230c9b56d003a217dcb9edaed1ea09c08b0eddd806e8fe92173b7ed18dc453a"
   },
   "releases": {
     "action/actions/checkout@v7.0.1": {
@@ -34,10 +31,6 @@
     "action/astral-sh/setup-uv@v10.3.3": {
       "published": "2026-10-28T14:35:19Z",
       "url": "https://api.github.com/repos/astral-sh/setup-uv/releases/tags/v10.3.3"
-    },
-    "ascend/tilelang-wheel": {
-      "published": "2026-09-09T07:20:07Z",
-      "url": "https://api.github.com/repos/tile-ai/tilelang-ascend/releases/tags/TileLang-ascend-v0.1.2.000-release"
     },
     "build/setuptools@84.2.1": {
       "published": "2026-10-20T19:01:37.742699Z",
@@ -1747,17 +1740,25 @@
       "published": "2025-11-03T09:25:26.604186Z",
       "url": "https://pypi.org/pypi/cloudpickle/3.1.2/json"
     },
-    "tools/environments/cuda/uv.lock/cuda-bindings@12.9.10": {
-      "published": "2026-10-15T14:12:01.260953Z",
-      "url": "https://pypi.org/pypi/cuda-bindings/12.9.10/json"
+    "tools/environments/cuda/uv.lock/cuda-bindings@13.5.0": {
+      "published": "2026-11-05T12:06:03.542665Z",
+      "url": "https://pypi.org/pypi/cuda-bindings/13.5.0/json"
+    },
+    "tools/environments/cuda/uv.lock/cuda-core@1.2.2": {
+      "published": "2026-10-16T13:58:48.968317Z",
+      "url": "https://pypi.org/pypi/cuda-core/1.2.2/json"
     },
     "tools/environments/cuda/uv.lock/cuda-pathfinder@1.8.5": {
       "published": "2026-10-29T19:15:06.747373Z",
       "url": "https://pypi.org/pypi/cuda-pathfinder/1.8.5/json"
     },
-    "tools/environments/cuda/uv.lock/cuda-python@12.9.10": {
-      "published": "2026-10-15T14:19:36.449996Z",
-      "url": "https://pypi.org/pypi/cuda-python/12.9.10/json"
+    "tools/environments/cuda/uv.lock/cuda-python@13.5.0": {
+      "published": "2026-11-05T12:17:47.465363Z",
+      "url": "https://pypi.org/pypi/cuda-python/13.5.0/json"
+    },
+    "tools/environments/cuda/uv.lock/cuda-toolkit@13.0.3.0": {
+      "published": "2026-04-14T00:50:08.173517Z",
+      "url": "https://pypi.org/pypi/cuda-toolkit/13.0.3.0/json"
     },
     "tools/environments/cuda/uv.lock/filelock@4.2.7": {
       "published": "2026-11-02T16:09:15.119537Z",
@@ -1823,9 +1824,65 @@
       "published": "2026-10-10T20:05:31.422199Z",
       "url": "https://pypi.org/pypi/numpy/2.5.4/json"
     },
-    "tools/environments/cuda/uv.lock/nvidia-nccl-cu12@2.32.3": {
-      "published": "2026-09-22T08:31:48.829969Z",
-      "url": "https://pypi.org/pypi/nvidia-nccl-cu12/2.32.3/json"
+    "tools/environments/cuda/uv.lock/nvidia-cublas@13.1.1.3": {
+      "published": "2026-04-08T18:46:22.985877Z",
+      "url": "https://pypi.org/pypi/nvidia-cublas/13.1.1.3/json"
+    },
+    "tools/environments/cuda/uv.lock/nvidia-cuda-cupti@13.0.85": {
+      "published": "2025-09-04T08:26:42.012357Z",
+      "url": "https://pypi.org/pypi/nvidia-cuda-cupti/13.0.85/json"
+    },
+    "tools/environments/cuda/uv.lock/nvidia-cuda-nvrtc@13.0.88": {
+      "published": "2025-09-04T08:28:20.239506Z",
+      "url": "https://pypi.org/pypi/nvidia-cuda-nvrtc/13.0.88/json"
+    },
+    "tools/environments/cuda/uv.lock/nvidia-cuda-runtime@13.0.96": {
+      "published": "2025-10-09T08:55:15.780917Z",
+      "url": "https://pypi.org/pypi/nvidia-cuda-runtime/13.0.96/json"
+    },
+    "tools/environments/cuda/uv.lock/nvidia-cudnn-cu13@9.24.0.43": {
+      "published": "2026-07-02T16:23:39.248719Z",
+      "url": "https://pypi.org/pypi/nvidia-cudnn-cu13/9.24.0.43/json"
+    },
+    "tools/environments/cuda/uv.lock/nvidia-cufft@12.0.0.61": {
+      "published": "2025-09-04T08:31:38.196564Z",
+      "url": "https://pypi.org/pypi/nvidia-cufft/12.0.0.61/json"
+    },
+    "tools/environments/cuda/uv.lock/nvidia-cufile@1.15.1.6": {
+      "published": "2025-09-04T08:32:14.119912Z",
+      "url": "https://pypi.org/pypi/nvidia-cufile/1.15.1.6/json"
+    },
+    "tools/environments/cuda/uv.lock/nvidia-curand@10.4.0.35": {
+      "published": "2025-08-04T10:21:41.128275Z",
+      "url": "https://pypi.org/pypi/nvidia-curand/10.4.0.35/json"
+    },
+    "tools/environments/cuda/uv.lock/nvidia-cusolver@12.0.4.66": {
+      "published": "2025-09-04T08:33:04.222785Z",
+      "url": "https://pypi.org/pypi/nvidia-cusolver/12.0.4.66/json"
+    },
+    "tools/environments/cuda/uv.lock/nvidia-cusparse@12.6.3.3": {
+      "published": "2025-09-04T08:33:42.864937Z",
+      "url": "https://pypi.org/pypi/nvidia-cusparse/12.6.3.3/json"
+    },
+    "tools/environments/cuda/uv.lock/nvidia-cusparselt-cu13@0.8.1": {
+      "published": "2025-09-05T18:49:51.289924Z",
+      "url": "https://pypi.org/pypi/nvidia-cusparselt-cu13/0.8.1/json"
+    },
+    "tools/environments/cuda/uv.lock/nvidia-nccl-cu13@2.30.7": {
+      "published": "2026-06-09T03:23:15.633676Z",
+      "url": "https://pypi.org/pypi/nvidia-nccl-cu13/2.30.7/json"
+    },
+    "tools/environments/cuda/uv.lock/nvidia-nvjitlink@13.5.37": {
+      "published": "2026-11-04T23:33:22.854137Z",
+      "url": "https://pypi.org/pypi/nvidia-nvjitlink/13.5.37/json"
+    },
+    "tools/environments/cuda/uv.lock/nvidia-nvshmem-cu13@3.4.5": {
+      "published": "2025-09-06T00:32:20.022078Z",
+      "url": "https://pypi.org/pypi/nvidia-nvshmem-cu13/3.4.5/json"
+    },
+    "tools/environments/cuda/uv.lock/nvidia-nvtx@13.0.85": {
+      "published": "2025-09-04T08:28:53.627342Z",
+      "url": "https://pypi.org/pypi/nvidia-nvtx/13.0.85/json"
     },
     "tools/environments/cuda/uv.lock/packaging@26.3": {
       "published": "2026-08-04T18:15:28.737071Z",
@@ -1883,13 +1940,13 @@
       "published": "2026-01-12T11:25:08.484157Z",
       "url": "https://pypi.org/pypi/torch-c-dlpack-ext/0.1.5/json"
     },
-    "tools/environments/cuda/uv.lock/torch@2.14.1+orinfer1": {
-      "published": "2026-10-22T03:38:18Z",
-      "url": "https://api.github.com/repos/iMMIQ/pytorch/releases/tags/jetson-v2.14.1-orinfer1-cu126-cp312-sm87"
+    "tools/environments/cuda/uv.lock/torch@2.14.0+cu130": {
+      "published": "2026-09-02T18:51:18Z",
+      "url": "https://download.pytorch.org/whl/cu130/torch/"
     },
-    "tools/environments/cuda/uv.lock/torchvision@0.29.1+orinfer1": {
-      "published": "2026-10-22T03:38:18Z",
-      "url": "https://api.github.com/repos/iMMIQ/pytorch/releases/tags/jetson-v2.14.1-orinfer1-cu126-cp312-sm87"
+    "tools/environments/cuda/uv.lock/torchvision@0.29.0+cu130": {
+      "published": "2026-09-02T00:28:04Z",
+      "url": "https://download.pytorch.org/whl/cu130/torchvision/"
     },
     "tools/environments/cuda/uv.lock/tqdm@4.70.1": {
       "published": "2026-09-11T07:25:16.601180Z",
@@ -1898,6 +1955,10 @@
     "tools/environments/cuda/uv.lock/transformers@5.22.1": {
       "published": "2026-10-30T07:48:03.721714Z",
       "url": "https://pypi.org/pypi/transformers/5.22.1/json"
+    },
+    "tools/environments/cuda/uv.lock/triton@3.8.0": {
+      "published": "2026-08-28T16:08:18.290238Z",
+      "url": "https://pypi.org/pypi/triton/3.8.0/json"
     },
     "tools/environments/cuda/uv.lock/truststore@0.10.5": {
       "published": "2026-10-12T22:27:31.808128Z",

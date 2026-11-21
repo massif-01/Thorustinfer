@@ -1,5 +1,6 @@
 """Small data execution package for CPU packaging and release tests."""
 
+from thorustinfer_build.compiler.cuda import target as cuda_target
 import hashlib
 
 from thorustinfer_build.packaging.compact import compact_package
@@ -13,7 +14,7 @@ def data_package(root, payload=b"fixture cubin bytes", **metadata):
     package = dict(
         architecture="qwen3_5",
         compute_policy="int8_quality",
-        target="sm_87",
+        target=cuda_target.architecture(),
         config_signature={},
         prefill_profiles=[],
         buffer_contracts=[],

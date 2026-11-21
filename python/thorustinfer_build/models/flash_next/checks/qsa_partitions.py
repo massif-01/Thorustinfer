@@ -1,5 +1,6 @@
 """Verify fixed QSA partitions while skipping inactive attention and merge work."""
 
+from thorustinfer_build.compiler.cuda import target as cuda_target
 import argparse
 from pathlib import Path
 
@@ -30,7 +31,7 @@ def main():
             explicit_rows(function),
             out_idx=[],
             execution_backend="nvrtc",
-            target={"kind": "cuda", "arch": "sm_87"},
+            **cuda_target.options(),
         )
 
     attention = compile_function(

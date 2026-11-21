@@ -1,5 +1,6 @@
 """Exact single-query arithmetic across short causal widths and owner packets."""
 
+from thorustinfer_build.compiler.cuda import target as cuda_target
 import argparse
 import json
 from pathlib import Path
@@ -147,7 +148,7 @@ def main():
                     fn,
                     out_idx=[],
                     execution_backend="nvrtc",
-                    target={"kind": "cuda", "arch": "sm_87"},
+                    **cuda_target.options(),
                 ),
                 names,
             )

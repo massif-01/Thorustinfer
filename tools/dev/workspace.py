@@ -30,7 +30,7 @@ def initialize(root, output, name):
     links.update(
         {
             root / "artifacts" / key: output / "cache" / key
-            for key in ["models", "execution-packages", "ascend-runtime"]
+            for key in ["models", "execution-packages"]
         }
     )
     links[root / "artifacts/gpu-experiment.lock"] = output / "locks/gpu-experiment.lock"

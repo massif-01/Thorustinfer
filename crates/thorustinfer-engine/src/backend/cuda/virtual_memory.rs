@@ -90,7 +90,6 @@ impl Reservation {
         let raw = crate::backend::growth::TokenLayout {
             row_bytes: self.stride,
             tokens_per_row: 1,
-            capacity_bytes: self.bytes,
         }
         .required_bytes(tokens)?;
         round_up(raw, self.granularity)
@@ -376,7 +375,6 @@ impl MappingOps for Ops<'_> {
             bytes: page.bytes,
             used,
             handle: Some(page.handle),
-            native: None,
         });
         // Until publication succeeds, this alias borrows the original handle.
         canonical.region.mappings.push(Slab {
@@ -443,7 +441,6 @@ pub(crate) fn restore_host(
         bytes: descriptor.bytes,
         used: descriptor.used,
         handle: Some(handle),
-        native: None,
     });
     let result: Result<()> = (|| {
         ops.map(0, descriptor.bytes, handle, false)?;
@@ -474,7 +471,7 @@ mod tests {
         let allocation = Rc::new(super::super::snapshot::Allocation {
             id: crate::backend::kv::allocation_id().unwrap(),
             used: 8192,
-            native: None,
+
             owner: thorustinfer_device::DeviceOwner::new(thorustinfer_device::Backend::Cuda, 0),
             address: 0,
             bytes: 8192,
@@ -526,7 +523,7 @@ mod tests {
         let allocation = Rc::new(super::super::snapshot::Allocation {
             id: crate::backend::kv::allocation_id().unwrap(),
             used: 8192,
-            native: None,
+
             owner: s.owner,
             address: source.address,
             bytes,

@@ -142,6 +142,7 @@ pub struct ChatRequest {
 }
 
 pub struct Prepared {
+    pub native_events: bool,
     pub tool_format: ToolFormat,
     pub input: Vec<u32>,
     pub prefix_hints: Vec<usize>,
@@ -165,11 +166,11 @@ pub struct Prepared {
 pub struct ChatCodec {
     pub boundary: Option<super::token_boundary::Boundary>,
     pub tool_format: ToolFormat,
-    pub tools_supported: bool,
     pub audio: Option<thorustinfer_engine::audio::AudioSpec>,
     pub tokenizer: Tokenizer,
     pub asset_hashes: std::collections::BTreeMap<String, String>,
     template: Environment<'static>,
+    responses_inline: std::sync::OnceLock<Result<Environment<'static>>>,
     preserves_historical_thinking: bool,
     pub eos: BTreeSet<u32>,
     defaults: generation_defaults::Defaults,
@@ -284,13 +285,12 @@ impl ChatCodec {
         Ok(Self {
             boundary,
             tool_format,
-            tools_supported: tool_format == ToolFormat::DeepSeekV41
-                || descriptor["metadata"]["target"] != "ascend910b",
             audio,
             defaults,
             tokenizer,
             asset_hashes,
             template: environment,
+            responses_inline: Default::default(),
             preserves_historical_thinking,
             eos,
             grammar,
@@ -554,7 +554,8 @@ impl ChatCodec {
             &request.image_processing,
             preparation,
         )?;
-        let mut messages = normalize_messages_for(raw_messages, self.tool_format)?;
+        let mut messages =
+            normalize_messages_for(raw_messages, self.tool_format, preparation.wire_kind)?;
         if self.audio.is_some() {
             for message in &mut messages {
                 if message["role"] == "user"
@@ -668,8 +669,30 @@ impl ChatCodec {
         };
         preparation.timing.normalize_s += normalize_started.elapsed().as_secs_f64();
         let render_started = std::time::Instant::now();
-        let mut rendered = self
-            .template
+        let environment = if preparation.wire_kind == Some(super::wire::Kind::Responses)
+            && self.tool_format == ToolFormat::Qwen
+            && messages.iter().skip(1).any(|m| m["role"] == "system")
+        {
+            self.responses_inline
+                .get_or_init(|| {
+                    let mut env = self.template.clone();
+                    let chat = self
+                        .template
+                        .get_template("chat")
+                        .map_err(|e| e.to_string())?;
+                    env.add_template_owned(
+                        "chat",
+                        super::wire::qwen_responses_template(chat.source()),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    Ok(env)
+                })
+                .as_ref()
+                .map_err(Clone::clone)?
+        } else {
+            &self.template
+        };
+        let mut rendered = environment
             .get_template("chat")
             .map_err(|e| e.to_string())?
             .render(context! { ..controlled, ..Serde(&request.chat_template_kwargs) })
@@ -706,11 +729,13 @@ impl ChatCodec {
         } else {
             input
         };
-        if !explicit_limit {
+        if preparation.count_only {
+            max_tokens = 0;
+        } else if !explicit_limit {
             max_tokens = max_tokens.min(context_limit.saturating_sub(input.len()));
         }
         if input.is_empty()
-            || max_tokens == 0
+            || (max_tokens == 0 && !preparation.count_only)
             || input
                 .len()
                 .checked_add(max_tokens)
@@ -737,7 +762,10 @@ impl ChatCodec {
         // still governs reuse; retention hints cannot reserve memory or prevent
         // eviction. Neither field changes the prompt or sampling identity.
         let constrained_tools = constraint.is_some();
-        if thinking && let Some(budget) = request.thinking_token_budget {
+        if !preparation.count_only
+            && thinking
+            && let Some(budget) = request.thinking_token_budget
+        {
             if max_tokens < 2 {
                 return Err("max_completion_tokens: Thinking budget needs room for </think> and an answer token".into());
             }
@@ -800,6 +828,7 @@ impl ChatCodec {
         prefix_hints.dedup();
         let _ = request.user; // Attribution only; it does not alter sampling identity.
         Ok(Prepared {
+            native_events: false,
             tool_format: if self.tool_format == ToolFormat::DeepSeekV41
                 && !native_tools
                 && constraint.is_some()
@@ -920,9 +949,13 @@ fn text_content(v: &Value, separator: &str) -> Result<String> {
 }
 #[cfg(test)]
 fn normalize_messages(messages: Vec<Value>) -> Result<Vec<Value>> {
-    normalize_messages_for(messages, ToolFormat::Qwen)
+    normalize_messages_for(messages, ToolFormat::Qwen, None)
 }
-fn normalize_messages_for(mut messages: Vec<Value>, format: ToolFormat) -> Result<Vec<Value>> {
+fn normalize_messages_for(
+    mut messages: Vec<Value>,
+    format: ToolFormat,
+    wire_kind: Option<super::wire::Kind>,
+) -> Result<Vec<Value>> {
     if messages.is_empty() {
         return Err("messages must not be empty".into());
     }
@@ -939,7 +972,10 @@ fn normalize_messages_for(mut messages: Vec<Value>, format: ToolFormat) -> Resul
             return Err("Unsupported message role".into());
         }
         if role == "system" || role == "developer" {
-            if dialogue && format != ToolFormat::DeepSeekV41 {
+            if dialogue
+                && format != ToolFormat::DeepSeekV41
+                && wire_kind != Some(super::wire::Kind::Responses)
+            {
                 return Err("System/developer messages must precede the dialogue".into());
             }
             if format != ToolFormat::DeepSeekV41 {
@@ -951,7 +987,7 @@ fn normalize_messages_for(mut messages: Vec<Value>, format: ToolFormat) -> Resul
         if role == "user" {
             user = true;
         }
-        if role != "tool" && !pending.is_empty() {
+        if role != "tool" && !(wire_kind.is_some() && role == "assistant") && !pending.is_empty() {
             return Err("Missing response for preceding tool call".into());
         }
         message["content"] = json!(text_content(
@@ -1025,6 +1061,7 @@ fn normalize_messages_for(mut messages: Vec<Value>, format: ToolFormat) -> Resul
     for message in messages {
         if format != ToolFormat::DeepSeekV41
             && message["role"] == "system"
+            && normalized.len() == 1
             && normalized.first().is_some_and(|m| m["role"] == "system")
         {
             let current = normalized[0]["content"].as_str().unwrap_or("");

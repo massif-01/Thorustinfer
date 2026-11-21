@@ -11,7 +11,8 @@ import numpy as np
 import tilelang
 import torch
 
-from thorustinfer_build.tuning.projection_tuning import make_prim, profile_stream, TARGET
+from thorustinfer_build.compiler.cuda import target as cuda_target
+from thorustinfer_build.tuning.projection_tuning import make_prim, profile_stream
 from kernels.cuda.model.q4_projection import MAGNITUDES
 from thorustinfer_build.compiler.cuda.common import configure, write_json
 
@@ -62,7 +63,7 @@ def main():
                         make_prim(spec, config),
                         out_idx=[],
                         execution_backend="nvrtc",
-                        target=TARGET,
+                        **cuda_target.options(),
                     )
                 )
                 weights = [

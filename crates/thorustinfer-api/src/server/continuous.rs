@@ -168,7 +168,6 @@ impl Ending {
     }
 }
 struct Active<'a> {
-    retain_image_memory: bool,
     request: RequestState,
     output: Response<'a>,
 }
@@ -189,9 +188,8 @@ struct Response<'a> {
     content_scores: Vec<Value>,
 }
 impl<'a> Active<'a> {
-    fn new(request: RequestState, job: Job, codec: &'a ChatCodec, has_images: bool) -> Self {
+    fn new(request: RequestState, job: Job, codec: &'a ChatCodec) -> Self {
         Self {
-            retain_image_memory: has_images,
             request,
             output: Response::new(job, codec),
         }
@@ -208,6 +206,7 @@ impl<'a> Response<'a> {
             job.prepared.stops.clone(),
             &job.id,
         );
+        parser.native_events = job.prepared.native_events;
         parser.tool_format(job.prepared.tool_format);
         parser.structured_json(job.prepared.structured);
         parser.constrained_tools(job.prepared.constrained_tools);
@@ -389,9 +388,9 @@ impl<'a> Response<'a> {
             .top_logprobs
             .map(|_| json!({"content":self.content_scores,"refusal":null}));
         let response = if job.prepared.stream {
-            // SSE has already delivered content and scores. Complete is only
-            // its terminal signal; do not retain a second full response.
-            json!({})
+            // The Chat SSE path uses only the terminal signal. Other encoders also
+            // need the actual usage, parser outcome and matched stop sequence.
+            json!({"finish_reason":reason,"usage":usage,"exhausted":exhausted,"incomplete_call":self.parser.incomplete_call,"stop_sequence":self.parser.stop_sequence})
         } else {
             json!({"id":job.id,"object":"chat.completion","created":job.created,"model":model,
                 "choices":[{"index":0,"message":self.parser.message(),"finish_reason":reason,"logprobs":logprobs}],"usage":usage})
@@ -452,7 +451,6 @@ pub(super) fn worker(
         let barrier = !waiting.is_empty()
             || active.iter().any(|a| {
                 a.finished()
-                    || a.request.has_pending_host_images()
                     || (a.request.is_prefilling()
                         && !a.output.mailbox.job.prepared.audios.is_empty())
             });
@@ -581,7 +579,6 @@ pub(super) fn worker(
                 .collect();
             let mut admitted = false;
             let mut cached_text = false;
-            let mut deferred_images = 0;
             let mut untried: Vec<_> = if latency {
                 (0..waiting.len()).collect()
             } else {
@@ -704,15 +701,7 @@ pub(super) fn worker(
                             job.events.is_closed() || shutdown.load(Ordering::Relaxed)
                         }) {
                             Ok(mut request) => {
-                                deferred_images = if has_images {
-                                    model.deferred_image_capacity(&costs[i])
-                                } else {
-                                    0
-                                };
-                                if has_images
-                                    && !request.has_pending_host_images()
-                                    && let Some(memory) = &job._memory
-                                {
+                                if has_images && let Some(memory) = &job._memory {
                                     memory.release_images();
                                 }
                                 if let Some(shared) = job.shared_prefix {
@@ -725,7 +714,7 @@ pub(super) fn worker(
                                 }
                                 cached_text = text_only
                                     && request.prefix_statistics().cached_tokens == prompt_tokens;
-                                let mut a = Active::new(request, job, codec, has_images);
+                                let mut a = Active::new(request, job, codec);
                                 a.output
                                     .mailbox
                                     .delta(model_id, json!({"role":"assistant","content":""}));
@@ -791,17 +780,12 @@ pub(super) fn worker(
                 }
             }
             if !admitted
-                || (deferred_images > 0 && admitted_count >= deferred_images)
                 || (latency
                     && scheduler::admission_should_yield(
                         has_decoders,
                         admitted_count,
                         admission.elapsed().as_secs_f64(),
-                        // Encoding runs after admission across the rank team.
-                        // A 10 ms host slice otherwise admits just one image
-                        // owner after its arena/prefix setup. The surrounding
-                        // loop still bounds admission by actual decode slack.
-                        cached_text || deferred_images > 0,
+                        cached_text,
                     ))
             {
                 break;
@@ -860,14 +844,6 @@ pub(super) fn worker(
             drop(responses);
             match result {
                 Ok(outputs) => {
-                    for a in &mut active {
-                        if a.retain_image_memory && !a.request.has_pending_host_images() {
-                            if let Some(memory) = &a.output.mailbox.job._memory {
-                                memory.release_images();
-                            }
-                            a.retain_image_memory = false;
-                        }
-                    }
                     for output in outputs {
                         let a = &mut active[output.request];
                         let packet = pipeline::Tokens {
@@ -981,6 +957,7 @@ mod tests {
             _memory: None,
             limits: Limits::default(),
             prepared: Prepared {
+                native_events: false,
                 tool_format: output::ToolFormat::Qwen,
                 audios: vec![],
                 input: vec![1],

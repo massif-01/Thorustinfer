@@ -8,11 +8,9 @@ use std::cmp::Ordering;
 pub const EVALUATION_SEED: u64 = 20_261_002;
 
 mod constrained;
-mod prepared;
 mod reporting;
+pub(crate) use constrained::verify_validated;
 pub use constrained::{Constraint, Decoder, TokenLogprob, verify};
-pub(crate) use constrained::{RowParameters, verify_validated};
-pub(crate) use prepared::Prepared;
 
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);

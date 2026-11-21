@@ -42,16 +42,6 @@ impl Worker {
 }
 
 pub(super) async fn start(settings: &Settings) -> Result<Worker> {
-    let descriptor: Value = serde_json::from_slice(
-        &std::fs::read(settings.model_dir.join("cache/model.json")).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    validate_shutdown_environment(
-        descriptor["metadata"]["target"]
-            .as_str()
-            .unwrap_or_default(),
-        std::env::var_os("ASCEND_COREDUMP_SIGNAL").as_deref(),
-    )?;
     let started = Instant::now();
     let settings = settings.clone();
     let default_request_params = Arc::new(settings.default_request_params.clone());
@@ -199,13 +189,6 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
     })
 }
 
-fn validate_shutdown_environment(target: &str, capture: Option<&std::ffi::OsStr>) -> Result<()> {
-    if target == "ascend910b" && capture != Some(std::ffi::OsStr::new("none")) {
-        return Err("A2 service requires ASCEND_COREDUMP_SIGNAL=none before process startup: CANN trace signal handlers bypass graceful shutdown".into());
-    }
-    Ok(())
-}
-
 // Fields drop in declaration order, including when frontend preparation fails:
 // finish model teardown before releasing GPU ownership.
 struct LoadedModel<T = Model> {
@@ -322,17 +305,6 @@ mod tests {
         worker.join().unwrap();
         assert!(!has_live_model_workers());
     }
-    #[test]
-    fn a2_signal_capture_conflicts_fail_before_worker_start() {
-        use std::ffi::OsStr;
-        assert!(validate_shutdown_environment("ascend910b", Some(OsStr::new("none"))).is_ok());
-        for capture in [None, Some(OsStr::new("all")), Some(OsStr::new(""))] {
-            let error = validate_shutdown_environment("ascend910b", capture).unwrap_err();
-            assert!(error.contains("ASCEND_COREDUMP_SIGNAL=none"));
-        }
-        assert!(validate_shutdown_environment("cuda", None).is_ok());
-    }
-
     #[test]
     fn frontend_overlaps_model_load_and_model_stays_on_owner() {
         let owner = std::thread::current().id();

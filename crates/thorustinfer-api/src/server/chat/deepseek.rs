@@ -239,7 +239,7 @@ mod tests {
         env.add_template(
             "chat",
             include_str!(
-                "../../../../../python/thorustinfer_build/models/deepseek_v41/templates/chat.jinja"
+                "../../../../../reference/deepseek-v41/python/thorustinfer_build/models/deepseek_v41/templates/chat.jinja"
             ),
         )
         .unwrap();
@@ -254,7 +254,7 @@ mod tests {
             )
             .unwrap();
             assert!(images.is_empty());
-            let messages = normalize_messages_for(raw, ToolFormat::DeepSeekV41).unwrap();
+            let messages = normalize_messages_for(raw, ToolFormat::DeepSeekV41, None).unwrap();
             let tools = request["tools"].as_array().cloned().unwrap_or_default();
             let (messages, schemas) = prepare(messages, &tools, None).unwrap();
             let effort = match request["reasoning_effort"].as_str() {

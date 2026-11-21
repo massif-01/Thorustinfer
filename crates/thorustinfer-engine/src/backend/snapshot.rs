@@ -155,7 +155,6 @@ mod tests {
             bytes: 20,
             used: 20,
             handle: None,
-            native: None,
         });
         let state = vec![
             Piece {
@@ -268,7 +267,7 @@ mod tests {
             allocation: Rc::new(Allocation {
                 id: 2,
                 used: 4,
-                native: None,
+
                 owner: foreign,
                 address: 42,
                 bytes: 4,

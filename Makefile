@@ -1,4 +1,4 @@
-.PHONY: check check-locks check-dependency-age fmt lint build info python-env cuda-env check-offline check-ascend-offline check-gpu
+.PHONY: check check-locks check-dependency-age fmt lint build info python-env cuda-env check-offline check-gpu
 
 UV ?= uv
 PYTHON = $(UV) run --locked python
@@ -34,7 +34,6 @@ check: check-locks lint
 	cargo check --workspace --locked --offline
 	cargo test --workspace --locked --offline
 	$(PYTHON) -m thorustinfer_build.common.testing --environment cpu
-	$(PYTHON) tools/bench/validate_plan.py
 
 info:
 	cargo run --offline -p thorustinfer-cli -- info
@@ -42,9 +41,6 @@ info:
 check-offline:
 	$(CUDA_PYTHON) -m thorustinfer_build.common.check_imports --backend cuda
 	$(CUDA_PYTHON) -m thorustinfer_build.common.testing --environment cuda
-
-check-ascend-offline:
-	bash tools/environments/ascend/run.sh --without-devices python3 -m thorustinfer_build.common.check_imports --backend ascend
 
 check-gpu:
 	$(PYTHON) tools/bench/check_gpu.py --model "$(MODEL)" --output "$(OUTPUT)"

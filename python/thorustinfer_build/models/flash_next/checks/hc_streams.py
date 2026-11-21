@@ -1,5 +1,6 @@
 """Verify independent HC streams against the original ordered projection."""
 
+from thorustinfer_build.compiler.cuda import target as cuda_target
 import argparse
 from pathlib import Path
 
@@ -20,7 +21,7 @@ def compile_kernel(primitive):
         explicit_rows(primitive),
         out_idx=[],
         execution_backend="nvrtc",
-        target={"kind": "cuda", "arch": "sm_87"},
+        **cuda_target.options(),
     )
 
 

@@ -18,70 +18,9 @@ pub(crate) enum Command {
         #[arg(long)]
         backend: thorustinfer_engine::backend::Backend,
     },
-    /// Validate bounded native Ascend transfers and W4A8 arithmetic on one device.
-    ValidateAscend {
-        #[arg(long, default_value_t = 0)]
-        device: u32,
-    },
-    /// Validate TileLang A2 AOT operators and changed-input native Graph replay.
-    ValidateAscendKernels {
-        #[arg(long, default_value_t = 7)]
-        device: u32,
-        #[arg(long)]
-        fixtures: PathBuf,
-    },
-    /// Compare the complete native A2 vision encoder with checkpoint reference fixtures.
-    ValidateAscendVision {
-        #[arg(long, default_value_t = 7)]
-        device: u32,
-        #[arg(long)]
-        program: PathBuf,
-        #[arg(long)]
-        model_dir: PathBuf,
-        #[arg(long)]
-        fixtures: PathBuf,
-    },
-    /// Benchmark complete single-sequence native A2 model execution.
-    BenchAscend {
-        #[arg(long)]
-        plan: PathBuf,
-        #[arg(long)]
-        model_dir: PathBuf,
-        #[arg(long)]
-        inputs: PathBuf,
-        #[arg(long, default_value_t = 128)]
-        output_tokens: usize,
-        #[arg(long, default_value_t = 3)]
-        repeats: usize,
-        #[arg(long)]
-        trace: Option<PathBuf>,
-    },
-    /// Benchmark shared-row native A2 requests with owner-private state.
-    BenchAscendBatch {
-        #[arg(long)]
-        plan: PathBuf,
-        #[arg(long)]
-        model_dir: PathBuf,
-        #[arg(long)]
-        inputs: PathBuf,
-    },
-    /// Validate native HCCL AllReduce and variable-count AlltoAllV on 2..8 devices.
-    ValidateHccl {
-        #[arg(long, value_delimiter = ',', required = true)]
-        devices: Vec<u32>,
-    },
-    /// Validate conditional-memory metadata and immutable host row staging on CPU.
-    ValidateEngram {
-        #[arg(long)]
-        metadata: PathBuf,
-        #[arg(long)]
-        model_dir: PathBuf,
-    },
-    /// Print the benchmark specification as JSON.
-    Plan,
     /// Check AOT fixture and file hashes without CUDA.
     ValidateArtifact { manifest: PathBuf },
-    /// Execute an SM87 AOT fixture and validate graph replay.
+    /// Execute a CUDA AOT fixture and validate graph replay.
     RunArtifact { manifest: PathBuf },
     /// Inspect the native model package plan without CUDA.
     PlanModel {
@@ -171,57 +110,6 @@ pub(crate) fn run(command: Command) -> Result<(), String> {
             print_json(info)
         }
         Command::Devices { backend } => print_json(thorustinfer_engine::backend::inspect(backend)?),
-        Command::ValidateAscend { device } => print_json(
-            thorustinfer_engine::backend::ascend::validation::run(device)?,
-        ),
-        Command::ValidateAscendKernels { device, fixtures } => print_json(
-            thorustinfer_engine::backend::ascend::kernels::validation::run(device, &fixtures)?,
-        ),
-        Command::ValidateAscendVision {
-            device,
-            program,
-            model_dir,
-            fixtures,
-        } => print_json(
-            thorustinfer_engine::backend::ascend::model::vision::validate(
-                device, &program, &model_dir, &fixtures,
-            )?,
-        ),
-        Command::BenchAscend {
-            plan,
-            model_dir,
-            inputs,
-            output_tokens,
-            repeats,
-            trace,
-        } => print_json(&thorustinfer_engine::backend::ascend::model::run(
-            &plan,
-            &model_dir,
-            &inputs,
-            output_tokens,
-            repeats,
-            trace.as_deref(),
-        )?),
-        Command::BenchAscendBatch {
-            plan,
-            model_dir,
-            inputs,
-        } => print_json(&thorustinfer_engine::backend::ascend::model::run_batch(
-            &plan, &model_dir, &inputs,
-        )?),
-        Command::ValidateHccl { devices } => print_json(
-            thorustinfer_engine::backend::ascend::hccl::validation::run(&devices)?,
-        ),
-        Command::ValidateEngram {
-            metadata,
-            model_dir,
-        } => print_json(thorustinfer_engine::host_rows::validation::run(
-            &metadata, &model_dir,
-        )?),
-        Command::Plan => {
-            println!("{}", thorustinfer_engine::BENCHMARK_PLAN);
-            Ok(())
-        }
         Command::ValidateArtifact { manifest } => {
             print_json(thorustinfer_engine::artifact::validate_artifact(&manifest)?)
         }
@@ -276,13 +164,13 @@ mod tests {
     #[test]
     fn backend_inventory_and_graph_alias_are_typed() {
         let Some(TopCommand::Diagnostics(Command::Devices { backend })) =
-            Cli::try_parse_from(["thorustinfer", "devices", "--backend", "ascend"])
+            Cli::try_parse_from(["thorustinfer", "devices", "--backend", "cuda"])
                 .unwrap()
                 .command
         else {
             unreachable!()
         };
-        assert_eq!(backend, thorustinfer_engine::backend::Backend::Ascend);
+        assert_eq!(backend, thorustinfer_engine::backend::Backend::Cuda);
         assert!(Cli::try_parse_from(["thorustinfer", "devices", "--backend", "unknown"]).is_err());
         let Some(TopCommand::Diagnostics(Command::RunModel(args))) = Cli::try_parse_from([
             "thorustinfer",

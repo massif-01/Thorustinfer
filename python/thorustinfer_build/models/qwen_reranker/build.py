@@ -1,5 +1,6 @@
 """Build a complete-sequence causal Qwen3-Reranker E8P execution package."""
 
+from thorustinfer_build.compiler.cuda import target as cuda_target
 from thorustinfer_build.common.paths import ROOT, gpu_lock_path, work_path
 
 
@@ -214,7 +215,7 @@ class Builder(Projections):
         )
         metadata = dict(
             schema_version=2,
-            target="sm_87",
+            target=cuda_target.architecture(),
             model="Qwen3-Reranker-0.6B-E8P-Q4A8",
             chunk_tokens=self.capacity,
             max_context=self.capacity,
@@ -233,7 +234,7 @@ class Builder(Projections):
             reranking=spec,
         )
         package = dict(
-            target="sm_87",
+            target=cuda_target.architecture(),
             architecture="qwen3_reranker",
             compute_policy="int8_quality",
             config_signature=signature(self.config),

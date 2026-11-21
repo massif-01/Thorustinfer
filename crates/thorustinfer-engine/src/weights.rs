@@ -10,21 +10,11 @@ use std::{
 };
 
 pub use thorustinfer_model_sdk::model::TensorIdentity;
-pub(crate) mod checkpoint;
 pub(crate) mod read;
 
 #[derive(Deserialize)]
 struct Index {
     weight_map: BTreeMap<String, String>,
-    #[serde(default)]
-    row_shards: BTreeMap<String, Vec<String>>,
-    #[serde(default)]
-    row_records: BTreeMap<String, RowRecords>,
-}
-#[derive(Deserialize)]
-struct RowRecords {
-    format: String,
-    parts: Vec<String>,
 }
 
 #[derive(Clone, Debug)]

@@ -21,9 +21,6 @@ impl ArenaLayout {
             ))
         }))
     }
-    pub fn from_sizes<'a>(buffers: impl Iterator<Item = (&'a str, usize, usize)>) -> Result<Self> {
-        Self::try_from_sizes(buffers.map(Ok))
-    }
     fn try_from_sizes<'a>(
         buffers: impl Iterator<Item = Result<(&'a str, usize, usize)>>,
     ) -> Result<Self> {

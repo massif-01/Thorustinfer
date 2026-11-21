@@ -16,7 +16,6 @@
 
 `runtime::requests::profile::profile_continuous_decode` 的夹具可设置 `sampling_batch=false`，在同一执行包上诊断逐请求 GPU 采样；默认使用包声明的批量路径。`hot_only=true` 记录固定 batch 的主干 GPU 时间及 CPU 分段，批量采样另记录控制回读、地址表、输入上传、提交和输出回读边界。分段用于定位，完整请求吞吐需另行验收。
 
-`validate_plan.py` 校验 benchmark 与快速评测配置，输出 CPU 配置检查结果。
 
 `output_stress.py` 对已启动的 Chat 服务执行定时混合负载，复用 `concurrency.py` 的 SSE 客户端，按 usage 统计真实输出 token。默认依次运行 1/8/16/32 并发，共发放请求 600 秒，每段结束等待在途请求完成；实际总时长含各段排空。输入为 `{"cases":[{"id":"math","request":{"model":"example","messages":[{"role":"user","content":"1+1，只输出JSON对象，字段value为整数。"}]},"checks":{"json_equals":{"value":2}}}]}`；`checks.contains` 可指定答案必须包含的字符串。请求原样保留采样参数和 EOS 设置，省略 seed 时使用服务默认行为。
 
@@ -132,22 +131,4 @@ python -m tools.bench.encoders --compare vllm-results.json native-results.json \
 
 原生构建逐项比对最终 `plan-model` 的 `row_execution.variants` 与离线选中的行数变体，确认执行计划实际引用这些绑定。构建基准身份文件时，记录所用引擎文件的 SHA256、执行包 digest 和实际选择表数量。
 
-## 合成 Mini-Weka 短测
-
-`mini_weka_synthetic.py` 生成可复现的合成 Weka 轨迹及 SHA256 manifest。默认 `compact` 有 512 条轨迹，冷首轮为 2、3、4 和 6 Ki tokens，每档 128 条，后续调用新增 256–768 tokens。每条包含 5 个主会话请求和 2 个共享前缀的并行子会话请求，输出上限为 32–256 tokens。实际长度及缓存命中以服务 usage 为准。
-
-`--profile long` 默认生成 16 条轨迹，冷首轮为 8、24、48、80 Ki tokens。两个 profile 均可用 `--trajectories` 指定轨迹数，取值为 4 的正整数倍。性能 A/B 使用同一 profile 和 manifest。
-
-```bash
-uv run --locked python -m tools.bench.mini_weka_synthetic \
-  --profile compact --output artifacts/bench/mini-weka-synthetic-compact-512-v1
-
-uv run --locked python -m tools.bench.mini_weka_compact \
-  --manifest artifacts/bench/mini-weka-synthetic-compact-512-v1/manifest.json \
-  --tokenizer "$TOKENIZER_DIR" --url http://127.0.0.1:18828/v1 \
-  --model qwen-flash-next --concurrency 4 --wall-limit 240 --output "$MINI_OUTPUT_DIR"
-```
-
-Compact 回放连接已启动的 Chat 服务。启动时核验所有轨迹 SHA256，准入时渲染对话。父子请求复用同一段 Chat 消息，两个子会话完成后主会话再继续。历史中的助手消息和工具输入使用冻结的合成文本，模型真实生成本轮输出。
-
-回放总时限默认 240 秒，`--request-count` 默认允许提交 100000 个 profiling 请求。512 条轨迹并发 4 时包含 4 个 warmup 请求和 3580 个可用 profiling 请求。回放记录每个已完成请求的 token 用量、首 token 时间和完成时间，汇总记录 manifest SHA256、输入身份和完成轨迹数。长输入压力测通过 `agentx_mini.py` 回放。 [AgentX Harness](https://github.com/SemiAnalysisAI/agentx-harness) · [配对口径](../../docs/performance.md)
+AgentX 与 Mini-Weka 基准见 [Thorustinfer-benchmarks](https://github.com/massif-01/Thorustinfer-benchmarks)。

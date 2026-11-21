@@ -14,7 +14,6 @@ Python 用于权重准备、TileLang 编译、调优和验证；在线加载、�
 | Nemotron-3.5-Embed-1B | 文本和视觉 E8P Q4A8 checkpoint | [nemotron_embed/build.py](../../docs/embeddings.md) |
 | Qwen3-Reranker-0.6B | 因果文本 E8P Q4A8、双行原始分类头 checkpoint | [qwen_reranker/build.py](../../docs/reranking.md) |
 | Qwen3.8-Flash-Next | 当前 schema-1 模型及其匹配执行包 | [flash_next/build.py](flash_next/README.md) |
-| DSv4.1 Flash-1017 / A2 | 当前计划及已预处理 W4A8 权重 | `python -m thorustinfer_build.models.deepseek_v41.build --rebuild-plan PLAN`，使用 CANN 9.2 前端 |
 
 27B 的当前部署方案为两级整数 E8P Q4A8。Flash Next 使用 E8P Q2A8 专家及质量优先的混合精度。量化组件与存储约定见[量化说明](../quantization/README.md)。
 
@@ -28,7 +27,7 @@ bash tools/environments/cuda/run.sh python/thorustinfer_build/models/flash_next/
   --model /path/to/native-flash-model --model-output artifacts/models/flash-ready
 ```
 
-CUDA 编译使用物理机 CUDA 12.6 和独立 uv 环境，A2 使用固定的 CANN 9.2 前端；环境说明见[编译说明](../build/README.md)。外部输入通过 `THORUSTINFER_CHECKPOINT_DIR` 只读挂载。所有 GPU 工作共用 `artifacts/gpu-experiment.lock`；构建输出使用新目录，已发布产物保持不可变。
+CUDA 编译使用物理机 CUDA 13.3 和 Thor 离线环境；环境说明见[编译说明](../build/README.md)。外部输入通过 `THORUSTINFER_CHECKPOINT_DIR` 只读挂载。所有 GPU 工作共用 `artifacts/gpu-experiment.lock`；构建输出使用新目录，已发布产物保持不可变。
 
 ## 产物与公共组件
 

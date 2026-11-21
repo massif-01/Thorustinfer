@@ -1,4 +1,4 @@
-//! Install CUDA and Ascend execution archives on CPU.
+//! Install CUDA execution archives on CPU.
 use super::ExecutionPackage;
 use crate::artifact::{Result, sha256};
 use serde::Serialize;
@@ -93,13 +93,6 @@ fn validate(root: &Path, digest: &str) -> Result<()> {
     let raw = fs::read(root.join("package.json")).map_err(|e| e.to_string())?;
     if sha256(&raw) != digest {
         return Err("Execution package digest mismatch".into());
-    }
-    let value: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
-    if value["backend"] == "ascend" {
-        let package: crate::models::deepseek_v41::provider::Package =
-            serde_json::from_value(value).map_err(|e| e.to_string())?;
-        super::generated::materialize(root, &package.generated_assets)?;
-        return crate::models::deepseek_v41::validation::validate_package(root, &package);
     }
     let package: ExecutionPackage = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
     package.validate_metadata()?;

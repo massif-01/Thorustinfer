@@ -79,6 +79,7 @@ fn find_marker(input: &str, controls: Controls<'_>, marker: &str) -> Option<usiz
 }
 
 pub struct Output {
+    pub(super) native_events: bool,
     format: ToolFormat,
     dsml_calls: bool,
     dsml_call: Option<dsml::Call>,
@@ -89,6 +90,7 @@ pub struct Output {
     in_tool: bool,
     pub stopped: bool,
     pub incomplete_call: bool,
+    pub stop_sequence: Option<String>,
     pub content: String,
     pub reasoning_content: String,
     pub calls: Vec<Value>,
@@ -105,6 +107,7 @@ pub struct Output {
 impl Output {
     pub fn new(thinking: bool, tools: Vec<Value>, stops: Vec<String>, id: &str) -> Self {
         Self {
+            native_events: false,
             format: ToolFormat::Qwen,
             dsml_calls: false,
             dsml_call: None,
@@ -115,6 +118,7 @@ impl Output {
             in_tool: false,
             stopped: false,
             incomplete_call: false,
+            stop_sequence: None,
             content: String::new(),
             reasoning_content: String::new(),
             calls: vec![],
@@ -175,7 +179,8 @@ impl Output {
             let stop = self
                 .stops
                 .iter()
-                .filter_map(|s| self.pending.find(s).map(|at| (at, s.len())))
+                .enumerate()
+                .filter_map(|(i, s)| self.pending.find(s).map(|at| (at, i)))
                 .min_by_key(|x| x.0);
             if self.dsml_call.is_some() {
                 let limit = stop.map_or(self.pending.len(), |(at, _)| at);
@@ -199,6 +204,9 @@ impl Output {
                             self.schemas.validate(&self.tools, name, &value)?;
                         }
                         self.calls.push(json!({"id":format!("call_{}_{}",self.call_prefix,self.calls.len()),"type":"function","function":{"name":name,"arguments":arguments}}));
+                        if self.native_events {
+                            deltas.push(json!({"validated_tool_index":self.calls.len()-1}));
+                        }
                         self.streamed_call = None;
                         self.dsml_call = None;
                         self.in_tool = false;
@@ -208,6 +216,7 @@ impl Output {
                 if consumed == 0 && waiting {
                     if stop.is_some() {
                         self.pending.clear();
+                        self.stop_sequence = stop.map(|(_, i)| self.stops[i].clone());
                         self.stopped = true;
                     }
                     break;
@@ -218,6 +227,7 @@ impl Output {
                 let end = call_end(&self.pending);
                 if stop.is_some_and(|(at, _)| end.is_none_or(|end| at < end)) {
                     self.pending.clear();
+                    self.stop_sequence = stop.map(|(_, i)| self.stops[i].clone());
                     self.stopped = true;
                     break;
                 }
@@ -240,6 +250,9 @@ impl Output {
                         &mut deltas,
                     )?;
                     self.calls.push(call);
+                    if self.native_events {
+                        deltas.push(json!({"validated_tool_index":self.calls.len()-1}));
+                    }
                     self.drain(end + "</tool_call>".len());
                     self.in_tool = false;
                     self.streamed_call = None;
@@ -279,6 +292,7 @@ impl Output {
                 let before = self.pending[..at].to_owned();
                 self.emit_text(&before, &mut deltas);
                 self.pending.clear();
+                self.stop_sequence = stop.map(|(_, i)| self.stops[i].clone());
                 self.stopped = true;
                 break;
             }

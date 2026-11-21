@@ -1,5 +1,6 @@
 """Check bulk projection tiles, partial rows/columns and changed-input replay."""
 
+from thorustinfer_build.compiler.cuda import target as cuda_target
 import argparse
 from pathlib import Path
 import tilelang
@@ -32,7 +33,7 @@ def main():
                 make_prim(spec, config),
                 out_idx=[],
                 execution_backend="nvrtc",
-                target={"kind": "cuda", "arch": "sm_87"},
+                **cuda_target.options(),
             )
         )
         for rows in [129, 257, 513]:
@@ -65,8 +66,7 @@ def main():
                 ),
                 out_idx=[],
                 execution_backend="nvrtc",
-                target={"kind": "cuda", "arch": "sm_87"},
-                pass_configs=EXACT_PASSES,
+                **cuda_target.options(EXACT_PASSES),
             )
         )
         group_kernel = profile_stream(
@@ -76,8 +76,7 @@ def main():
                 ),
                 out_idx=[],
                 execution_backend="nvrtc",
-                target={"kind": "cuda", "arch": "sm_87"},
-                pass_configs=EXACT_PASSES,
+                **cuda_target.options(EXACT_PASSES),
             )
         )
         for rows in [129, 257, 513]:

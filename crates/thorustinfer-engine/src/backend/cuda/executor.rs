@@ -183,9 +183,6 @@ impl Executor {
         let manifest = &prepared.plan;
         let target = thorustinfer_device::Target::from_package(&manifest.target)?;
         target.require_host(std::env::consts::ARCH)?;
-        if target.backend == thorustinfer_device::Backend::Ascend {
-            return Err("This package requires Ascend model execution; no Ascend model provider is registered yet".into());
-        }
         if prepared.policy == "nvfp4_ffn"
             && (options.mtp_drafts.unwrap_or(0) > 0 || options.prompt_lookup)
         {
