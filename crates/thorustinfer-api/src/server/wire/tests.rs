@@ -82,18 +82,31 @@ fn terminal_metadata_controls_usage_stops_and_incomplete_tools() {
     for kind in [Kind::Responses, Kind::Messages] {
         let (_, wire) = translate(kind, source(kind, true)).unwrap();
         let mut e = response::Encoder::new(wire.clone(), "i".into(), 1, 13);
-        e.chunk(&delta(json!({"tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":"{\"file\":"}}]}))).unwrap();
+        let opening = e.chunk(&delta(json!({"tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":"{\"file\":"}}]}))).unwrap();
         let (r, events) = e.finish(&complete("length")).unwrap();
         if kind.messages() {
             assert_eq!(r["stop_reason"], "max_tokens");
             assert_eq!(r["content"], json!([]));
         } else {
             assert_eq!(r["status"], "incomplete");
-            assert_eq!(r["output"], json!([]))
+            let item = &r["output"][0];
+            assert_eq!(r["output"].as_array().unwrap().len(), 1);
+            assert_eq!(opening[0]["item"]["id"], item["id"]);
+            assert_eq!(opening[0]["item"]["call_id"], item["call_id"]);
+            assert_eq!(opening[1]["delta"], item["arguments"]);
+            assert_eq!(item["arguments"], "{\"file\":");
+            assert_eq!(item["status"], "incomplete");
+            assert_eq!(events[0]["type"], "response.output_item.done");
+            assert_eq!(events[0]["item"], *item);
+            assert_eq!(events[1]["type"], "response.incomplete");
+            assert_eq!(events[1]["response"], r);
+            assert!(
+                !events
+                    .iter()
+                    .any(|v| v["type"] == "response.function_call_arguments.done")
+            );
         }
-        assert!(!events.iter().any(
-            |v| v["type"] == "response.output_item.done" || v["type"] == "content_block_start"
-        ));
+        assert!(!events.iter().any(|v| v["type"] == "content_block_start"));
         let mut e = response::Encoder::new(wire, "j".into(), 1, 13);
         let mut meta = complete("stop");
         meta["stop_sequence"] = json!("END");
@@ -204,5 +217,177 @@ fn emitted_ordered_content_replays_with_reversed_parallel_results() {
         assert_eq!(m[4]["content"], "X");
         assert_eq!(m[5]["content"], "Y");
         assert_eq!(text_of(&m[6]["content"]), "compare");
+    }
+}
+
+#[test]
+fn responses_echo_protocol_tools_and_effective_choice() {
+    let tools = json!([{"type":"namespace","name":"files","tools":[{"type":"custom","name":"patch","format":{"type":"text"}}]}]);
+    let forced = json!({"type":"custom","name":"patch","namespace":"files"});
+    for (declared, choice, expected) in [
+        (Some(tools.clone()), Some(forced.clone()), forced),
+        (Some(tools), None, json!("auto")),
+        (None, None, json!("none")),
+    ] {
+        let mut input = json!({"model":"m","input":"hello"});
+        if let Some(t) = &declared {
+            input["tools"] = t.clone();
+        }
+        if let Some(c) = choice {
+            input["tool_choice"] = c;
+        }
+        let (chat, mut wire) = translate(Kind::Responses, input).unwrap();
+        wire.resolve_response_tools(&serde_json::from_value(chat).unwrap());
+        let mut encoder = response::Encoder::new(wire, "r".into(), 1, 13);
+        let start = encoder.start();
+        let (body, end) = encoder.finish(&complete("stop")).unwrap();
+        for obj in [
+            &body,
+            &start[0]["response"],
+            &start[1]["response"],
+            &end.last().unwrap()["response"],
+        ] {
+            assert_eq!(obj["tools"], declared.clone().unwrap_or(json!([])));
+            assert_eq!(obj["tool_choice"], expected);
+        }
+    }
+}
+
+#[test]
+fn messages_explicit_custom_is_an_input_schema_tool() {
+    let mut body = source(Kind::Messages, false);
+    let (implicit, _) = translate(Kind::Messages, body.clone()).unwrap();
+    body["tools"][0]["type"] = json!("custom");
+    let (explicit, wire) = translate(Kind::Messages, body).unwrap();
+    assert_eq!(implicit["tools"], explicit["tools"]);
+    assert!(!wire.tools["read"].custom);
+}
+
+fn qwen_frontend() -> (ChatCodec, thorustinfer_engine::vision::VisionSpec) {
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("THORUSTINFER_PROTOCOL_TEST_MODEL")
+            .expect("set the Qwen3.5 vision model directory"),
+    );
+    let model: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("cache/model.json")).unwrap()).unwrap();
+    (
+        ChatCodec::load(&dir).unwrap(),
+        serde_json::from_value(model["metadata"]["vision"].clone()).unwrap(),
+    )
+}
+
+#[test]
+#[ignore = "requires Qwen3.5 frontend assets; CPU only"]
+fn qwen_responses_inline_instructions_render_as_ordered_system_turns() {
+    let (codec, _) = qwen_frontend();
+    let input = json!({"model":"m","instructions":"initial","input":[{"role":"user","content":"old question"},{"role":"assistant","content":"old answer"},{"role":"developer","content":"new rule"},{"role":"system","content":"next rule"},{"role":"user","content":"new question"}]});
+    let (chat, wire) = translate(Kind::Responses, input).unwrap();
+    let mut ctx = preparation::Context::unbounded();
+    assert!(
+        codec
+            .prepare(
+                serde_json::from_value(chat.clone()).unwrap(),
+                "m",
+                32768,
+                None,
+                &mut ctx
+            )
+            .err()
+            .unwrap()
+            .contains("must precede")
+    );
+    ctx.wire_kind = Some(wire.kind);
+    let result = codec
+        .prepare(
+            serde_json::from_value(chat).unwrap(),
+            "m",
+            32768,
+            None,
+            &mut ctx,
+        )
+        .unwrap();
+    let prompt = codec.tokenizer.decode(&result.input, false).unwrap();
+    assert!(prompt.contains("<|im_start|>system\ninitial<|im_end|>\n<|im_start|>user\nold question<|im_end|>\n<|im_start|>assistant\nold answer<|im_end|>\n<|im_start|>system\nnew rule<|im_end|>\n<|im_start|>system\nnext rule<|im_end|>\n<|im_start|>user\nnew question<|im_end|>"),"{prompt}");
+}
+
+#[test]
+#[ignore = "requires Qwen3.5 vision frontend assets; CPU only"]
+fn tool_result_images_reach_their_qwen_tool_turns_and_pixels() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let (codec, vision) = qwen_frontend();
+    let png = |rgb| {
+        let img = ::image::RgbImage::from_pixel(112, 112, ::image::Rgb(rgb));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, ::image::ImageFormat::Png).unwrap();
+        STANDARD.encode(out.into_inner())
+    };
+    let red = png([255, 0, 0]);
+    let blue = png([0, 0, 255]);
+    for kind in [Kind::Messages, Kind::Responses] {
+        let parts = |label: &str, data: &str| {
+            if kind.messages() {
+                json!([{"type":"text","text":label},{"type":"image","source":{"type":"base64","media_type":"image/png","data":data}},{"type":"text","text":" suffix"}])
+            } else {
+                json!([{"type":"input_text","text":label},{"type":"input_image","image_url":format!("data:image/png;base64,{data}")},{"type":"input_text","text":" suffix"}])
+            }
+        };
+        let mut v = source(kind, false);
+        if kind.messages() {
+            v["messages"] = json!([{"role":"user","content":"read both"},{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"read","input":{}},{"type":"tool_use","id":"b","name":"read","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"b","content":parts("second",&blue)},{"type":"tool_result","tool_use_id":"a","is_error":true,"content":parts("first",&red)},{"type":"text","text":"follow up"}]}]);
+        } else {
+            v["input"] = json!([{"role":"user","content":"read both"},{"type":"function_call","call_id":"a","name":"read","arguments":"{}"},{"type":"custom_tool_call","call_id":"b","name":"patch","input":"text"},{"type":"custom_tool_call_output","call_id":"b","output":parts("second",&blue)},{"type":"function_call_output","call_id":"a","output":parts("first",&red)},{"role":"user","content":"follow up"}]);
+        }
+        let (chat, wire) = translate(kind, v).unwrap();
+        assert_eq!(chat["messages"][2]["tool_call_id"], "a");
+        assert_eq!(chat["messages"][3]["tool_call_id"], "b");
+        let mut ctx = preparation::Context::unbounded();
+        assert!(
+            codec
+                .prepare(
+                    serde_json::from_value(chat.clone()).unwrap(),
+                    "m",
+                    32768,
+                    Some(&vision),
+                    &mut ctx
+                )
+                .err()
+                .unwrap()
+                .contains("Image parts")
+        );
+        ctx.wire_kind = Some(wire.kind);
+        let result = codec
+            .prepare(
+                serde_json::from_value(chat).unwrap(),
+                "m",
+                32768,
+                Some(&vision),
+                &mut ctx,
+            )
+            .unwrap();
+        assert_eq!(result.images.len(), 2);
+        let mut blocks = Vec::new();
+        for (image, (label, rgb)) in result
+            .images
+            .iter()
+            .zip([("first", [255, 0, 0]), ("second", [0, 0, 255])])
+        {
+            assert_eq!(image.rgb[..3], rgb);
+            let n = vision.feature_count(image).unwrap();
+            assert!(n > 1);
+            let prefix = if kind.messages() && label == "first" {
+                "Tool error: "
+            } else {
+                ""
+            };
+            blocks.push(format!("<tool_response>\n{prefix}{label}<|vision_start|>{}<|vision_end|> suffix\n</tool_response>","<|image_pad|>".repeat(n)));
+        }
+        let prompt = codec.tokenizer.decode(&result.input, false).unwrap();
+        assert!(
+            prompt.contains(&format!(
+                "{}\n{}<|im_end|>\n<|im_start|>user\nfollow up",
+                blocks[0], blocks[1]
+            )),
+            "{prompt}"
+        );
     }
 }

@@ -3,7 +3,7 @@ mod request;
 mod response;
 use super::*;
 use axum::body::Body;
-pub(crate) use request::translate;
+pub(crate) use request::{qwen_responses_template, translate};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -38,6 +38,8 @@ pub(crate) struct Wire {
     stream: bool,
     pub(super) parallel: bool,
     tools: BTreeMap<String, Tool>,
+    response_tools: Vec<Value>,
+    response_choice: Value,
 }
 impl Wire {
     fn local(name: &str, namespace: Option<&str>) -> String {

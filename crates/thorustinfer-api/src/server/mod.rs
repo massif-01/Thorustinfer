@@ -358,7 +358,7 @@ async fn prepare_chat(
     admission: preparation::Ingress,
     body: std::result::Result<Json<Value>, JsonRejection>,
     render: bool,
-    wire: Option<wire::Wire>,
+    mut wire: Option<wire::Wire>,
 ) -> Response {
     let counting = wire.as_ref().is_some_and(|w| w.kind == wire::Kind::Count);
     let request = match body {
@@ -435,7 +435,10 @@ async fn prepare_chat(
     let context = state.context;
     let vision = state.vision.clone();
     let image_cache = Arc::clone(&state.preparation.images);
-    let ordered_assistant_parts = wire.is_some();
+    if let Some(w) = &mut wire {
+        w.resolve_response_tools(&request);
+    }
+    let wire_kind = wire.as_ref().map(|w| w.kind);
     let cancellation = preparation::Cancellation::default();
     let flag = cancellation.flag();
     let pool = Arc::clone(&state.preparation);
@@ -446,7 +449,7 @@ async fn prepare_chat(
         let mut preparation = estimate.context(flag);
         preparation.images = Some(image_cache);
         preparation.count_only = counting;
-        preparation.ordered_assistant_parts = ordered_assistant_parts;
+        preparation.wire_kind = wire_kind;
         preparation.timing = timing;
         let started = Instant::now();
         let result = (|| -> Result<_> {

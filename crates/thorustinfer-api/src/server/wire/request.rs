@@ -51,6 +51,31 @@ fn content(v: &Value) -> Result<Value> {
     }
     Ok(Value::Array(out))
 }
+// Keep text-only results in their existing representation. Mixed results stay
+// in blocks until the vision frontend has decoded the images in their turn.
+fn tool_output(v: &Value, error: bool) -> Result<Value> {
+    if v.as_array().is_some_and(|parts| {
+        parts
+            .iter()
+            .any(|p| matches!(p["type"].as_str(), Some("image" | "input_image")))
+    }) {
+        let mut parts = content(v)?;
+        if error {
+            parts
+                .as_array_mut()
+                .unwrap()
+                .insert(0, json!({"type":"text","text":"Tool error: "}));
+        }
+        Ok(parts)
+    } else {
+        let result = text(v)?;
+        Ok(json!(if error {
+            format!("Tool error: {result}")
+        } else {
+            result
+        }))
+    }
+}
 fn add_tool(w: &mut Wire, out: &mut Vec<Value>, t: &Value, namespace: Option<&str>) -> Result<()> {
     let kind = t["type"]
         .as_str()
@@ -62,7 +87,7 @@ fn add_tool(w: &mut Wire, out: &mut Vec<Value>, t: &Value, namespace: Option<&st
         return Ok(());
     }
     let custom = kind == "custom" && !w.kind.messages();
-    if kind != "function" && !custom {
+    if !matches!(kind, "function" | "custom") {
         return Err(format!("Unsupported tool type {kind}"));
     }
     let name = string(t, "name")?;
@@ -173,7 +198,7 @@ impl History {
         self.pending.push(id.into());
         Ok(())
     }
-    fn result(&mut self, id: &str, content: String) -> Result<()> {
+    fn result(&mut self, id: &str, content: Value) -> Result<()> {
         if !self.pending.iter().any(|n| n == id)
             || self
                 .results
@@ -221,7 +246,7 @@ fn response_input(v: &Value) -> Result<Vec<Value>> {
                     h.call(string(x, "call_id")?, &local, args)?
                 }
                 "function_call_output" | "custom_tool_call_output" => {
-                    h.result(string(x, "call_id")?, text(&x["output"])?)?
+                    h.result(string(x, "call_id")?, tool_output(&x["output"], false)?)?
                 }
                 "reasoning" if x["encrypted_content"].is_null() => {}
                 kind => return Err(format!("Unsupported Responses input item {kind}")),
@@ -258,14 +283,11 @@ fn messages_input(v: &Value) -> Result<Vec<Value>> {
                     h.call(string(b, "id")?, string(b, "name")?, b["input"].to_string())?;
                 }
                 Some("tool_result") if role == "user" && body.is_empty() => {
-                    let mut result = if b["content"].is_null() {
-                        String::new()
-                    } else {
-                        text(&b["content"])?
-                    };
-                    if b["is_error"] == true {
-                        result = format!("Tool error: {result}");
-                    }
+                    let empty = json!("");
+                    let result = tool_output(
+                        b.get("content").filter(|v| !v.is_null()).unwrap_or(&empty),
+                        b["is_error"] == true,
+                    )?;
                     h.result(string(b, "tool_use_id")?, result)?;
                 }
                 _ => return Err("Unsupported or misplaced Messages content block".into()),
@@ -289,6 +311,8 @@ pub(crate) fn translate(kind: Kind, v: Value) -> Result<(Value, Wire)> {
         model: model.clone(),
         stream,
         tools: BTreeMap::new(),
+        response_tools: Vec::new(),
+        response_choice: Value::Null,
         parallel: true,
     };
     let mut chat = json!({"model":model});
@@ -298,7 +322,7 @@ pub(crate) fn translate(kind: Kind, v: Value) -> Result<(Value, Wire)> {
             add_tool(&mut w, &mut tools, t, None)?
         }
     }
-    if !tools.is_empty() {
+    if !tools.is_empty() || (kind == Kind::Responses && v.get("tools").is_some()) {
         chat["tools"] = json!(tools);
     }
     let allow = if kind.messages() {
@@ -447,8 +471,95 @@ pub(crate) fn translate(kind: Kind, v: Value) -> Result<(Value, Wire)> {
                 json!(!x.as_bool().ok_or("Invalid disable_parallel_tool_use")?);
         }
     }
+    if kind == Kind::Responses {
+        w.response_tools = v["tools"].as_array().cloned().unwrap_or_default();
+        w.response_choice = v["tool_choice"].clone();
+    }
     if kind != Kind::Count {
         chat["stream"] = json!(true);
     }
     Ok((chat, w))
+}
+
+impl Wire {
+    pub(crate) fn resolve_response_tools(&mut self, request: &super::chat::ChatRequest) {
+        if self.kind != Kind::Responses {
+            return;
+        }
+        if self.response_tools.is_empty() {
+            for t in &request.tools {
+                let mut tool = t["function"].clone();
+                if let Some(name) = tool["name"].as_str() {
+                    self.tools.insert(
+                        name.into(),
+                        Tool {
+                            name: name.into(),
+                            namespace: None,
+                            custom: false,
+                        },
+                    );
+                    tool["type"] = json!("function");
+                    self.response_tools.push(tool);
+                }
+            }
+        }
+        if self.response_choice.is_null() {
+            self.response_choice = match &request.tool_choice {
+                Some(c) if c["type"] == "function" => {
+                    let name = c["function"]["name"].as_str().unwrap_or_default();
+                    let mut choice = json!({"type":"function","name":name});
+                    if let Some(t) = self.tools.get(name) {
+                        choice["type"] = json!(if t.custom { "custom" } else { "function" });
+                        choice["name"] = json!(t.name);
+                        if let Some(ns) = &t.namespace {
+                            choice["namespace"] = json!(ns);
+                        }
+                    }
+                    choice
+                }
+                Some(c) => c.clone(),
+                None if request.tools.is_empty() => json!("none"),
+                None => json!("auto"),
+            };
+        }
+    }
+}
+
+// Extend the Qwen message-role dispatch, leaving the checkpoint's first system
+// turn (including the tools preamble) and all other roles to the original body.
+pub(crate) fn qwen_responses_template(template: &str) -> String {
+    for (start, _) in template.match_indices("{%") {
+        let Some((tag, _)) = template[start + 2..].split_once("%}") else {
+            break;
+        };
+        let statement = tag.trim_matches(['-', '+']).trim();
+        let Some((branch @ ("if" | "elif"), condition)) = statement.split_once(char::is_whitespace)
+        else {
+            continue;
+        };
+        let Some((role, value)) = condition.split_once("==") else {
+            continue;
+        };
+        if !matches!(
+            role.trim(),
+            "message.role" | "message['role']" | "message[\"role\"]"
+        ) || !matches!(value.trim(), "'system'" | "\"system\"")
+        {
+            continue;
+        }
+        let end = start + 2 + tag.len() + 2;
+        let original = &template[start..end];
+        let inline = original.replacen(
+            condition.trim(),
+            "not loop.first and message.role == 'system'",
+            1,
+        );
+        let first = original.replacen(branch, "elif", 1);
+        return format!(
+            "{}{inline}{{{{- '<|im_start|>system\\n' ~ (message.content|trim) ~ '<|im_end|>\\n' }}}}{first}{}",
+            &template[..start],
+            &template[end..]
+        );
+    }
+    template.to_owned()
 }

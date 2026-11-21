@@ -170,6 +170,7 @@ pub struct ChatCodec {
     pub tokenizer: Tokenizer,
     pub asset_hashes: std::collections::BTreeMap<String, String>,
     template: Environment<'static>,
+    responses_inline: std::sync::OnceLock<Result<Environment<'static>>>,
     preserves_historical_thinking: bool,
     pub eos: BTreeSet<u32>,
     defaults: generation_defaults::Defaults,
@@ -289,6 +290,7 @@ impl ChatCodec {
             tokenizer,
             asset_hashes,
             template: environment,
+            responses_inline: Default::default(),
             preserves_historical_thinking,
             eos,
             grammar,
@@ -552,11 +554,8 @@ impl ChatCodec {
             &request.image_processing,
             preparation,
         )?;
-        let mut messages = normalize_messages_for(
-            raw_messages,
-            self.tool_format,
-            preparation.ordered_assistant_parts,
-        )?;
+        let mut messages =
+            normalize_messages_for(raw_messages, self.tool_format, preparation.wire_kind)?;
         if self.audio.is_some() {
             for message in &mut messages {
                 if message["role"] == "user"
@@ -670,8 +669,30 @@ impl ChatCodec {
         };
         preparation.timing.normalize_s += normalize_started.elapsed().as_secs_f64();
         let render_started = std::time::Instant::now();
-        let mut rendered = self
-            .template
+        let environment = if preparation.wire_kind == Some(super::wire::Kind::Responses)
+            && self.tool_format == ToolFormat::Qwen
+            && messages.iter().skip(1).any(|m| m["role"] == "system")
+        {
+            self.responses_inline
+                .get_or_init(|| {
+                    let mut env = self.template.clone();
+                    let chat = self
+                        .template
+                        .get_template("chat")
+                        .map_err(|e| e.to_string())?;
+                    env.add_template_owned(
+                        "chat",
+                        super::wire::qwen_responses_template(chat.source()),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    Ok(env)
+                })
+                .as_ref()
+                .map_err(Clone::clone)?
+        } else {
+            &self.template
+        };
+        let mut rendered = environment
             .get_template("chat")
             .map_err(|e| e.to_string())?
             .render(context! { ..controlled, ..Serde(&request.chat_template_kwargs) })
@@ -928,12 +949,12 @@ fn text_content(v: &Value, separator: &str) -> Result<String> {
 }
 #[cfg(test)]
 fn normalize_messages(messages: Vec<Value>) -> Result<Vec<Value>> {
-    normalize_messages_for(messages, ToolFormat::Qwen, false)
+    normalize_messages_for(messages, ToolFormat::Qwen, None)
 }
 fn normalize_messages_for(
     mut messages: Vec<Value>,
     format: ToolFormat,
-    ordered_assistant_parts: bool,
+    wire_kind: Option<super::wire::Kind>,
 ) -> Result<Vec<Value>> {
     if messages.is_empty() {
         return Err("messages must not be empty".into());
@@ -951,7 +972,10 @@ fn normalize_messages_for(
             return Err("Unsupported message role".into());
         }
         if role == "system" || role == "developer" {
-            if dialogue && format != ToolFormat::DeepSeekV41 {
+            if dialogue
+                && format != ToolFormat::DeepSeekV41
+                && wire_kind != Some(super::wire::Kind::Responses)
+            {
                 return Err("System/developer messages must precede the dialogue".into());
             }
             if format != ToolFormat::DeepSeekV41 {
@@ -963,10 +987,7 @@ fn normalize_messages_for(
         if role == "user" {
             user = true;
         }
-        if role != "tool"
-            && !(ordered_assistant_parts && role == "assistant")
-            && !pending.is_empty()
-        {
+        if role != "tool" && !(wire_kind.is_some() && role == "assistant") && !pending.is_empty() {
             return Err("Missing response for preceding tool call".into());
         }
         message["content"] = json!(text_content(
@@ -1040,6 +1061,7 @@ fn normalize_messages_for(
     for message in messages {
         if format != ToolFormat::DeepSeekV41
             && message["role"] == "system"
+            && normalized.len() == 1
             && normalized.first().is_some_and(|m| m["role"] == "system")
         {
             let current = normalized[0]["content"].as_str().unwrap_or("");

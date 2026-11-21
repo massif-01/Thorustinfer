@@ -58,7 +58,7 @@ impl Encoder {
         if self.wire.kind.messages() {
             json!({"id":format!("msg_{}",self.id),"type":"message","role":"assistant","model":self.wire.model,"content":out,"stop_reason":if status=="in_progress"{Value::Null}else if status=="incomplete"{json!("max_tokens")}else if !stop.is_null(){json!("stop_sequence")}else if self.reason.as_deref()==Some("tool_calls"){json!("tool_use")}else{json!("end_turn")},"stop_sequence":stop,"usage":self.usage()})
         } else {
-            json!({"id":format!("resp_{}",self.id),"object":"response","created_at":self.created,"status":status,"error":null,"incomplete_details":if status=="incomplete"{json!({"reason":"max_output_tokens"})}else{Value::Null},"model":self.wire.model,"output":out,"parallel_tool_calls":self.wire.parallel,"store":false,"usage":if status=="in_progress"{Value::Null}else{self.usage()}})
+            json!({"id":format!("resp_{}",self.id),"object":"response","created_at":self.created,"status":status,"error":null,"incomplete_details":if status=="incomplete"{json!({"reason":"max_output_tokens"})}else{Value::Null},"model":self.wire.model,"output":out,"tools":self.wire.response_tools,"tool_choice":self.wire.response_choice,"parallel_tool_calls":self.wire.parallel,"store":false,"usage":if status=="in_progress"{Value::Null}else{self.usage()}})
         }
     }
     pub fn start(&mut self) -> Vec<Value> {
@@ -313,6 +313,21 @@ impl Encoder {
         };
         let mut events = Vec::new();
         self.close_text(status, &mut events);
+        if status == "incomplete"
+            && !self.wire.kind.messages()
+            && let Some(Part::Call { id, name, args, .. }) = self.active.take()
+            && !self.wire.tools[&name].custom
+        {
+            let i = self.items.len();
+            let mut item = self.tool_item(i, &id, &self.wire.tools[&name]);
+            item["arguments"] = json!(args);
+            item["status"] = json!("incomplete");
+            events.push(self.event(
+                "response.output_item.done",
+                json!({"output_index":i,"item":item}),
+            ));
+            self.items.push(item);
+        }
         let items = std::mem::take(&mut self.items);
         let response = self.response(status, items, &meta["stop_sequence"]);
         if self.wire.kind.messages() {

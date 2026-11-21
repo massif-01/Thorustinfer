@@ -194,7 +194,9 @@ def check(url, model, key, report, managed):
             )
         else:
             assert cut[-1]["type"] == "response.incomplete" and not any(
-                e["type"] == "response.output_item.done" and e["item"]["type"] == "function_call"
+                e["type"] == "response.output_item.done"
+                and e["item"]["type"] == "function_call"
+                and e["item"]["status"] == "completed"
                 for e in cut
             )
 

@@ -68,7 +68,7 @@ impl Drop for Cancellation {
 }
 pub(super) struct Context {
     pub count_only: bool,
-    pub ordered_assistant_parts: bool,
+    pub wire_kind: Option<super::wire::Kind>,
     pub timing: Timing,
     pub images: Option<Arc<super::image::cache::Cache>>,
     cancelled: Arc<AtomicBool>,
@@ -82,7 +82,7 @@ impl Context {
         Self {
             timing: Timing::default(),
             count_only: false,
-            ordered_assistant_parts: false,
+            wire_kind: None,
             images: None,
             cancelled,
             budget,
