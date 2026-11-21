@@ -11,8 +11,8 @@ Thorustinfer 在 Jetson Thor 上运行本地模型。同一个 HTTP 地址提供
 在装有兼容 NVIDIA 驱动的 Jetson Thor（Linux aarch64）上解压运行包，执行安装脚本。安装和运行都不需要 Python，也不用创建 conda 环境。`info` 显示引擎信息，`devices` 列出可用的 GPU。
 
 ```bash
-tar -xJf thorustinfer-0.2.1-linux-aarch64.tar.xz
-bash thorustinfer-0.2.1-linux-aarch64/install.sh
+tar -xJf thorustinfer-0.2.2-linux-aarch64.tar.xz
+bash thorustinfer-0.2.2-linux-aarch64/install.sh
 CLI="$HOME/.local/opt/thorustinfer/bin/thorustinfer"
 "$CLI" info
 "$CLI" devices --backend cuda

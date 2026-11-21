@@ -11,8 +11,8 @@ Run a local model on Jetson Thor. A single HTTP address serves OpenAI Chat Compl
 On a Jetson Thor running Linux aarch64 with a compatible NVIDIA driver, unpack the archive and run the installer. You can install and run the engine without Python or a conda environment. Use `info` to inspect the engine and `devices` to list the GPUs it can see.
 
 ```bash
-tar -xJf thorustinfer-0.2.1-linux-aarch64.tar.xz
-bash thorustinfer-0.2.1-linux-aarch64/install.sh
+tar -xJf thorustinfer-0.2.2-linux-aarch64.tar.xz
+bash thorustinfer-0.2.2-linux-aarch64/install.sh
 CLI="$HOME/.local/opt/thorustinfer/bin/thorustinfer"
 "$CLI" info
 "$CLI" devices --backend cuda

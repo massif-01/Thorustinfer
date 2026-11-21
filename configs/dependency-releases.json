@@ -3,21 +3,21 @@
   "minimum_age_days": 7,
   "files": {
     ".github/workflows/check.yml": "708e463bb1cfe833fbc3060c610747ca1138ca20c2313a4838d963466219dbab",
-    "Cargo.lock": "e755a2e9f3af74dec818249314020dc5839008cecca6c2c41acd48e5c88d4fbe",
-    "Cargo.toml": "4fbbd0334c4e68d342c7a0dad4aff183764cc76e2693867f2d606c9963df67df",
+    "Cargo.lock": "6bc051c43401a7721e16b030de624d5254c55d1dd2211338e733574a4356fdc0",
+    "Cargo.toml": "6882fec6e5b1a2409dc7ea6323e66bc04cdd2d57ce568fbb979af385fe2bc24b",
     "crates/thorustinfer-api/Cargo.toml": "deca6d61a00fa75fd0c834cce7fb61295f1a60e05515314d3a9cf8f6ee154a77",
     "crates/thorustinfer-cli/Cargo.toml": "ecb16606fb797fbdc38e721c4f53f8a5f35aa6f20ca7524a458e23abd15b0cba",
     "crates/thorustinfer-device/Cargo.toml": "d2195d4665f86847f3f3320acb6a2621a50013f13910fffbf0875d81eac52627",
     "crates/thorustinfer-engine/Cargo.toml": "1c85dad0a76b0d101837e165ede53d7c26d2f525c3722a988a2671db40d03321",
     "crates/thorustinfer-model-sdk/Cargo.toml": "a91932de62c4a7bae3f7f4b0320378fb205084f92995a559d9342f46be8264d5",
     "crates/thorustinfer-models/Cargo.toml": "117a99c0935c02d336a2a7ab487b880234830cd1476484aebaafbb8deec6b0d4",
-    "pyproject.toml": "b08594d0bd11ed8b17591d7e265b8f2bf2638f0e1863473d2b7c80e00b31ec5e",
+    "pyproject.toml": "14577e0de0d0d499b323d016b31cf23d5355369da7015629e8c69d2b19330e8b",
     "rust-toolchain.toml": "7553618f800829444096beea3dce84c3d07585efda504c19adb6787369bbd9e8",
-    "tools/environments/cuda/pyproject.toml": "d02a70cddb943d89694ae40eca2781c55e8ed959a03bc65a80fe4281af78a096",
-    "tools/environments/cuda/uv.lock": "944c932068d4759ff62f15b146c877df72ca13340c68e62b72ec9fb9eda7ed23",
+    "tools/environments/cuda/pyproject.toml": "4fb325c31d040304bdfc2a55eba9c0d86dbf64a593d8be76ab9cdc8e3e1d724d",
+    "tools/environments/cuda/uv.lock": "a98ed0de98b03eec7516fe760bb9c6a1677e054a37c354bd83b0f2b76df5cb28",
     "tools/environments/thor/requirements.in": "39b300464f54429c7eb02c24756d0dc27fe6d5f1e361e4daaa014183ee02bcee",
     "tools/environments/thor/requirements.lock": "08582a4310e26dfca6f00a2e0a4b41805d2fc91980e0eb3cb7610b7fb584fd99",
-    "uv.lock": "1230c9b56d003a217dcb9edaed1ea09c08b0eddd806e8fe92173b7ed18dc453a"
+    "uv.lock": "cbaba2d746e556909d951391137873c9be4d86bdec395821002764a4e4dfd7f5"
   },
   "releases": {
     "action/actions/checkout@v7.0.1": {
