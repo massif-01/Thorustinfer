@@ -1,5 +1,6 @@
 """Validate exact routing, QSA selection and PLE fusion on the target GPU."""
 
+from thorustinfer_build.compiler.cuda import target as cuda_target
 import argparse
 import importlib.util
 from pathlib import Path
@@ -18,7 +19,7 @@ def compile_kernel(fn):
         explicit_rows(fn),
         out_idx=[],
         execution_backend="nvrtc",
-        target={"kind": "cuda", "arch": "sm_87"},
+        **cuda_target.options(),
     )
 
 

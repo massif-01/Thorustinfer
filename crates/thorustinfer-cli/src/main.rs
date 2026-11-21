@@ -17,7 +17,7 @@ fn print_json(value: impl serde::Serialize) -> Result<(), String> {
 fn exit_with_unfinished_workers(pending: bool) {
     if pending {
         // SAFETY: Native teardown is still live or resources were quarantined.
-        // Running CANN process-exit hooks concurrently can double-free native
+        // Running process-exit hooks concurrently can double-free native
         // state. _exit terminates this standalone process without those hooks;
         // the OS reclaims its threads, accelerator handles and GPU lease.
         unsafe { libc::_exit(1) };
@@ -25,13 +25,6 @@ fn exit_with_unfinished_workers(pending: bool) {
 }
 fn main() -> ExitCode {
     let cli = Cli::parse_command();
-    if matches!(&cli.command, Some(Command::Service(_)))
-        && std::env::var_os("ASCEND_COREDUMP_SIGNAL").is_none()
-    {
-        // SAFETY: main has not started runtime, preprocessing or accelerator
-        // threads. CANN trace handlers otherwise preempt graceful shutdown.
-        unsafe { std::env::set_var("ASCEND_COREDUMP_SIGNAL", "none") };
-    }
     let result = match cli
         .command
         .unwrap_or(Command::Diagnostics(diag::Command::Info {
@@ -42,18 +35,10 @@ fn main() -> ExitCode {
         Command::Service(command) => serve::run(command, &cli.data_dir),
     };
     match result {
-        Ok(()) => {
-            exit_with_unfinished_workers(
-                thorustinfer_engine::backend::ascend::runtime::has_quarantined_resources(),
-            );
-            ExitCode::SUCCESS
-        }
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
-            exit_with_unfinished_workers(
-                thorustinfer_api::has_live_model_workers()
-                    || thorustinfer_engine::backend::ascend::runtime::has_quarantined_resources(),
-            );
+            exit_with_unfinished_workers(thorustinfer_api::has_live_model_workers());
             ExitCode::FAILURE
         }
     }

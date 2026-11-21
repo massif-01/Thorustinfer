@@ -35,7 +35,7 @@ def test_modules(root=ROOT, environment="cpu"):
                         isinstance(t, ast.Name) and t.id == "TEST_ENVIRONMENT" for t in node.targets
                     ):
                         selected = ast.literal_eval(node.value)
-                if selected not in {"cpu", "cuda", "ascend"}:
+                if selected not in {"cpu", "cuda"}:
                     raise ValueError(f"Unknown test environment: {path}")
                 if selected == environment:
                     relative = path.relative_to(root)
@@ -47,7 +47,7 @@ def test_modules(root=ROOT, environment="cpu"):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--environment", choices=["cpu", "cuda", "ascend"], default="cpu")
+    parser.add_argument("--environment", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
     modules = test_modules(environment=args.environment)

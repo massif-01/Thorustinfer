@@ -110,17 +110,10 @@ pub struct Kernel {
 }
 
 /// Native host wrappers interpret tiling buffers through the declared args ABI.
-/// Ascend block dimensions and workspace are not CUDA grid/block/shared memory.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "backend", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Launch {
-    ThorNvfp4 {
-        operation: Nvfp4Operation,
-    },
-    Ascend {
-        block_dim: u32,
-        workspace_bytes: usize,
-    },
+    ThorNvfp4 { operation: Nvfp4Operation },
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -133,42 +126,19 @@ impl Launch {
     pub fn backend(&self) -> thorustinfer_device::Backend {
         match self {
             Self::ThorNvfp4 { .. } => thorustinfer_device::Backend::Cuda,
-            Self::Ascend { .. } => thorustinfer_device::Backend::Ascend,
         }
     }
 }
 
-pub(crate) fn validate_geometry(
-    launch: Option<&Launch>,
-    grid: Option<[u32; 3]>,
-    block: [u32; 3],
-    shared: u32,
-    cooperative: bool,
-) -> Result<()> {
-    match launch {
-        None | Some(Launch::ThorNvfp4 { .. }) => {
-            if grid.is_some_and(|g| g.contains(&0))
-                || block.contains(&0)
-                || block
-                    .iter()
-                    .try_fold(1u32, |n, d| n.checked_mul(*d))
-                    .is_none_or(|n| n > 1024)
-            {
-                return Err("Invalid CUDA launch dimensions".into());
-            }
-        }
-        Some(Launch::Ascend { block_dim, .. }) => {
-            if *block_dim == 0
-                || grid.is_some_and(|g| g != [0; 3])
-                || block != [0; 3]
-                || shared != 0
-                || cooperative
-            {
-                return Err(
-                    "Ascend launch requires block_dim and rejects CUDA launch fields".into(),
-                );
-            }
-        }
+pub(crate) fn validate_geometry(grid: Option<[u32; 3]>, block: [u32; 3]) -> Result<()> {
+    if grid.is_some_and(|g| g.contains(&0))
+        || block.contains(&0)
+        || block
+            .iter()
+            .try_fold(1u32, |n, d| n.checked_mul(*d))
+            .is_none_or(|n| n > 1024)
+    {
+        return Err("Invalid CUDA launch dimensions".into());
     }
     Ok(())
 }
@@ -183,13 +153,7 @@ impl Kernel {
         if self.backend() != target.backend {
             return Err("Kernel backend differs from package target".into());
         }
-        validate_geometry(
-            self.launch.as_ref(),
-            Some(self.grid),
-            self.block,
-            self.shared_memory_bytes,
-            self.cooperative,
-        )
+        validate_geometry(Some(self.grid), self.block)
     }
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -226,60 +190,13 @@ mod tests {
             .validate_launch(&Target::from_package("sm_87").unwrap())
             .unwrap();
         assert_eq!(serde_json::to_value(&parsed).unwrap(), original);
-        assert!(
-            parsed
-                .validate_launch(&Target::from_package("ascend910b").unwrap())
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn ascend_launch_preserves_native_geometry_and_rejects_cuda_fields() {
-        let mut value = kernel();
-        for field in ["grid", "block", "shared_memory_bytes", "cooperative"] {
-            value.as_object_mut().unwrap().remove(field);
-        }
-        value["launch"] =
-            serde_json::json!({"backend":"ascend", "block_dim":24, "workspace_bytes":4096});
-        let parsed: Kernel = serde_json::from_value(value.clone()).unwrap();
-        let target = Target::from_package("ascend910b").unwrap();
-        parsed.validate_launch(&target).unwrap();
-        let serialized = serde_json::to_value(&parsed).unwrap();
-        assert_eq!(serialized["launch"], value["launch"]);
-        assert!(
-            parsed
-                .validate_launch(&Target::from_package("sm_87").unwrap())
-                .is_err()
-        );
-        for (field, bad) in [
-            ("grid", serde_json::json!([1, 1, 1])),
-            ("block", serde_json::json!([1, 1, 1])),
-            ("shared_memory_bytes", serde_json::json!(1)),
-            ("cooperative", serde_json::json!(true)),
-        ] {
-            let mut invalid = value.clone();
-            invalid[field] = bad;
-            assert!(
-                serde_json::from_value::<Kernel>(invalid)
-                    .unwrap()
-                    .validate_launch(&target)
-                    .is_err()
-            );
-        }
-        value["launch"]["block_dim"] = serde_json::json!(0);
-        assert!(
-            serde_json::from_value::<Kernel>(value)
-                .unwrap()
-                .validate_launch(&target)
-                .is_err()
-        );
     }
 
     #[test]
     fn cuda_launch_rejects_zero_and_overflowing_geometry() {
         for block in [[0, 1, 1], [1025, 1, 1], [u32::MAX, u32::MAX, 1]] {
-            assert!(validate_geometry(None, Some([1; 3]), block, 0, false).is_err());
+            assert!(validate_geometry(Some([1; 3]), block).is_err());
         }
-        assert!(validate_geometry(None, Some([0, 1, 1]), [32, 1, 1], 0, false).is_err());
+        assert!(validate_geometry(Some([0, 1, 1]), [32, 1, 1]).is_err());
     }
 }

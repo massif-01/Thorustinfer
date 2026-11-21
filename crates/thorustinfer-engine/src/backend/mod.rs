@@ -1,6 +1,5 @@
 //! Device implementation boundary for model execution and diagnostics.
 pub(crate) mod arena;
-pub mod ascend;
 pub(crate) mod cuda;
 pub(crate) mod growth;
 pub(crate) mod kv;
@@ -25,7 +24,6 @@ pub struct Inventory {
 }
 pub fn inspect(backend: Backend) -> crate::artifact::Result<Inventory> {
     match backend {
-        Backend::Ascend => ascend::inspect(),
         Backend::Cuda => cuda::inspect(),
     }
 }

@@ -11,7 +11,6 @@ import re
 import tempfile
 import time
 import tomllib
-from urllib.parse import unquote, urlsplit
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,9 +34,6 @@ def inputs(root):
         "pyproject.toml",
         "tools/environments/cuda/pyproject.toml",
         ".github/workflows/check.yml",
-        "tools/environments/ascend/run.sh",
-        "tools/environments/ascend/Dockerfile",
-        "tools/build/jetson_wheels.json",
         "tools/environments/thor/requirements.in",
         "tools/environments/thor/requirements.lock",
     ]
@@ -116,23 +112,18 @@ def pypi_url(name, version):
     return f"https://pypi.org/pypi/{name}/{version}/json"
 
 
-def github_asset(registry, url, checksum):
-    parts = urlsplit(url)
-    if parts.hostname != "github.com":
-        raise ValueError(f"Unreviewed direct dependency: {url}")
-    owner, repo, releases, download, tag, filename = unquote(parts.path).strip("/").split("/")
-    if (releases, download) != ("releases", "download"):
-        raise ValueError("Direct dependencies must identify a release asset")
-    metadata = f"https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}"
-    release = registry.json(metadata)
-    if release["draft"] or release["prerelease"]:
-        raise ValueError("Direct dependency is not a stable release")
-    asset = next(v for v in release["assets"] if v["name"] == filename)
-    if asset.get("digest") and asset["digest"] != "sha256:" + checksum:
-        raise ValueError(f"Release asset checksum changed: {filename}")
-    return dict(
-        published=max(release["published_at"], asset["created_at"], key=timestamp), url=metadata
+def pytorch_wheel(registry, name, url, checksum):
+    if name not in {"torch", "torchvision"}:
+        raise ValueError(f"Unreviewed direct dependency: {name}")
+    source = f"https://download.pytorch.org/whl/cu130/{name}/"
+    link = re.escape(url + "#sha256=" + checksum)
+    match = re.search(
+        r'href="' + link + r'"[^>]*data-upload-time="([^"]+)"',
+        registry.raw(source).decode(),
     )
+    if not match:
+        raise ValueError(f"{name} wheel differs from official CUDA index")
+    return dict(published=match[1], url=source)
 
 
 def thor_wheels(root, registry):
@@ -151,17 +142,9 @@ def thor_wheels(root, registry):
         requirement = requirement.strip()
         if requirement.startswith("torch @ "):
             url = requirement.split(" @ ", 1)[1]
-            source = "https://download.pytorch.org/whl/cu130/torch/"
             if len(hashes) != 1:
                 raise ValueError("Expected one Thor PyTorch wheel")
-            link = re.escape(url + "#sha256=" + next(iter(hashes)))
-            match = re.search(
-                r'href="' + link + r'"[^>]*data-upload-time="([^"]+)"',
-                registry.raw(source).decode(),
-            )
-            if not match:
-                raise ValueError("Thor PyTorch wheel differs from official CUDA index")
-            releases["thor/torch-cu130"] = dict(published=match[1], url=source)
+            releases["thor/torch-cu130"] = pytorch_wheel(registry, "torch", url, next(iter(hashes)))
             continue
         name, version = requirement.split("==")
         url = pypi_url(name, version)
@@ -226,8 +209,11 @@ def refresh(root=ROOT):
                 continue
             if "url" in source:
                 artifact = package.get("sdist") or package["wheels"][0]
-                releases[key] = github_asset(
-                    registry, source["url"], artifact["hash"].removeprefix("sha256:")
+                releases[key] = pytorch_wheel(
+                    registry,
+                    package["name"],
+                    source["url"],
+                    artifact["hash"].removeprefix("sha256:"),
                 )
                 continue
             if source.get("registry") != "https://pypi.org/simple":
@@ -279,11 +265,6 @@ def refresh(root=ROOT):
     if uv["draft"] or uv["prerelease"]:
         raise ValueError("CI uv must identify a stable release")
     releases[f"uv/{uv_version}"] = dict(published=uv["published_at"], url=uv_url)
-    runner = (root / "tools/environments/ascend/run.sh").read_text()
-    wheel = re.search(r"wheel_url='([^']+)'", runner)[1]
-    docker = (root / "tools/environments/ascend/Dockerfile").read_text()
-    digest = re.search(r'hexdigest\(\)=="([a-f0-9]{64})"', docker)[1]
-    releases["ascend/tilelang-wheel"] = github_asset(registry, wheel, digest)
     releases.update(thor_wheels(root, registry))
     record = dict(
         schema=1, minimum_age_days=7, files=inputs(root), releases=dict(sorted(releases.items()))

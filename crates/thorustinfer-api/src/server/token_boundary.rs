@@ -232,7 +232,7 @@ pub(super) mod tests {
         std::fs::write(
             directory.join("chat_template.jinja"),
             include_str!(
-                "../../../../python/thorustinfer_build/models/deepseek_v41/templates/chat.jinja"
+                "../../../../reference/deepseek-v41/python/thorustinfer_build/models/deepseek_v41/templates/chat.jinja"
             ),
         )
         .unwrap();

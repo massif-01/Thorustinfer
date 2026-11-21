@@ -1,7 +1,7 @@
 //! Shared KV ownership and mapping transitions. Device adapters issue native calls.
 pub(crate) mod host;
 use crate::artifact::Result;
-use std::{any::Any, cell::Cell, rc::Rc};
+use std::{cell::Cell, rc::Rc};
 use thorustinfer_device::{DeviceOwner, MemoryRange};
 
 thread_local! { static NEXT: Cell<u64> = const { Cell::new(0) }; }
@@ -33,7 +33,6 @@ pub(crate) struct Allocation {
     pub bytes: usize,
     pub used: usize,
     pub handle: Option<u64>,
-    pub native: Option<Rc<dyn Any>>,
 }
 impl std::fmt::Debug for Allocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -474,7 +473,6 @@ pub(crate) fn preview(
                 bytes: page.bytes,
                 used: stop - page.offset,
                 handle: Some(page.handle),
-                native: None,
             })
         });
         out.push((
@@ -689,7 +687,7 @@ mod tests {
     #[test]
     fn checkpoint_shares_full_allocations_and_packs_only_the_partial_suffix() {
         for grain in [64, 2 << 20] {
-            let owner = DeviceOwner::new(thorustinfer_device::Backend::Ascend, 0);
+            let owner = DeviceOwner::new(thorustinfer_device::Backend::Cuda, 0);
             let allocation = |bytes| {
                 Rc::new(Allocation {
                     owner,
@@ -698,7 +696,6 @@ mod tests {
                     bytes,
                     used: bytes,
                     handle: Some(9),
-                    native: None,
                 })
             };
             let regions = checkpoint_regions(vec![
@@ -835,7 +832,6 @@ mod tests {
                 bytes: p.bytes,
                 used,
                 handle: Some(p.handle),
-                native: None,
             }))
         }
     }
@@ -968,13 +964,12 @@ mod tests {
     fn logical_alias_and_budget_rules_are_independent_of_native_granularity() {
         for grain in [64, 256, 2 << 20] {
             let a = Allocation {
-                owner: DeviceOwner::new(thorustinfer_device::Backend::Ascend, 0),
+                owner: DeviceOwner::new(thorustinfer_device::Backend::Cuda, 0),
                 id: 2,
                 address: 3,
                 bytes: grain,
                 used: 17,
                 handle: Some(9),
-                native: None,
             };
             assert_eq!(
                 alias_offset(

@@ -2,13 +2,13 @@
 //! A deterministic portable approximation plus an offline XOR correction stream
 //! reproduces the original FP32 bytes across libm/CPU versions. Inference reads
 //! ordinary installed files and never generates or hashes these assets on load.
-use crate::artifact::{FileIdentity, Result, read_identity};
+use crate::artifact::Result;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Write},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -16,22 +16,6 @@ use std::{
 pub enum ComponentKind {
     Sin,
     Cos,
-}
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct Asset {
-    pub output: FileIdentity,
-    pub recipe: Recipe,
-}
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Recipe {
-    RopeF32V1 {
-        rows: usize,
-        frequencies: Vec<u32>,
-        component: ComponentKind,
-        corrections: FileIdentity,
-    },
 }
 #[derive(Serialize)]
 pub struct EncodedRope {
@@ -89,43 +73,7 @@ fn dimensions(rows: usize, frequencies: &[u32]) -> Result<usize> {
         .and_then(|n| n.checked_mul(4))
         .ok_or_else(|| "Generated RoPE size overflow".into())
 }
-fn relative(path: &str) -> Result<&Path> {
-    let path = Path::new(path);
-    if path.as_os_str().is_empty()
-        || path
-            .components()
-            .any(|p| !matches!(p, Component::Normal(_)))
-    {
-        return Err("Generated asset requires a relative normal path".into());
-    }
-    Ok(path)
-}
-impl Asset {
-    pub(crate) fn validate(&self) -> Result<()> {
-        relative(&self.output.file)?;
-        if self.output.tensor.is_some() {
-            return Err("Generated output must be a standalone file".into());
-        }
-        let Recipe::RopeF32V1 {
-            rows,
-            frequencies,
-            corrections,
-            ..
-        } = &self.recipe;
-        dimensions(*rows, frequencies)?;
-        relative(&corrections.file)?;
-        if corrections.tensor.is_some() || corrections.file == self.output.file {
-            return Err("Invalid generated correction identity".into());
-        }
-        Ok(())
-    }
-    pub(crate) fn verify_recipe(&self, root: &Path) -> Result<()> {
-        self.validate()?;
-        let Recipe::RopeF32V1 { corrections, .. } = &self.recipe;
-        read_identity(root, corrections)?;
-        Ok(())
-    }
-}
+#[cfg(test)]
 fn generate(
     rows: usize,
     frequencies: &[u32],
@@ -158,49 +106,6 @@ fn generate(
     Ok(())
 }
 /// Materialize only inside the installer's private, regular-file staging tree.
-pub(crate) fn materialize(root: &Path, assets: &[Asset]) -> Result<()> {
-    if assets.len() > 64 {
-        return Err("Too many generated assets".into());
-    }
-    let mut outputs = BTreeSet::new();
-    for asset in assets {
-        asset.validate()?;
-        if !outputs.insert(&asset.output.file) {
-            return Err("Duplicate generated asset output".into());
-        }
-    }
-    for asset in assets {
-        let Recipe::RopeF32V1 {
-            rows,
-            frequencies,
-            component,
-            corrections,
-        } = &asset.recipe;
-        let compressed = read_identity(root, corrections)?;
-        let patch = lzma_rust2::XzReader::new_mem_limit(compressed.as_slice(), true, 256 * 1024);
-        let target = root.join(relative(&asset.output.file)?);
-        let parent = target.parent().ok_or("Generated asset has no parent")?;
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        if !parent
-            .canonicalize()
-            .map_err(|e| e.to_string())?
-            .starts_with(root)
-        {
-            return Err("Generated asset leaves package directory".into());
-        }
-        let file = File::options()
-            .write(true)
-            .create_new(true)
-            .open(&target)
-            .map_err(|e| e.to_string())?;
-        let mut writer = BufWriter::new(file);
-        generate(*rows, frequencies, *component, patch, &mut writer)?;
-        writer.flush().map_err(|e| e.to_string())?;
-        writer.get_ref().sync_all().map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
 /// Offline encoding writes raw XOR streams; Python publication compresses them.
 /// Frequency inference is offline only; corrections preserve every original bit.
 pub fn encode_rope(cos: &Path, sin: &Path, columns: usize, output: &Path) -> Result<EncodedRope> {
@@ -360,40 +265,6 @@ mod tests {
             )
             .unwrap();
             assert_eq!(output, reference);
-        }
-    }
-
-    #[test]
-    fn installation_checks_corrections_and_never_overwrites_existing_files() {
-        use crate::artifact::sha256;
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        let mut encoder =
-            lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(1)).unwrap();
-        encoder.write_all(&[0u8; 128 * 4]).unwrap();
-        let patch = encoder.finish().unwrap();
-        fs::write(root.join("patch.xz"), &patch).unwrap();
-        let asset: Asset = serde_json::from_value(serde_json::json!({
-            "output":{"file":"table.bin","sha256":"0".repeat(64)},
-            "recipe":{"kind":"rope_f32_v1","rows":128,"frequencies":[1.0f32.to_bits()],
-                "component":"sin","corrections":{"file":"patch.xz","sha256":sha256(&patch)}}
-        }))
-        .unwrap();
-        materialize(root, std::slice::from_ref(&asset)).unwrap();
-        let original = fs::read(root.join("table.bin")).unwrap();
-        assert_eq!(original.len(), 128 * 4);
-        assert!(materialize(root, std::slice::from_ref(&asset)).is_err());
-        assert_eq!(fs::read(root.join("table.bin")).unwrap(), original);
-        fs::remove_file(root.join("table.bin")).unwrap();
-        fs::write(root.join("patch.xz"), b"corrupt").unwrap();
-        assert!(
-            materialize(root, std::slice::from_ref(&asset))
-                .unwrap_err()
-                .contains("sha256")
-        );
-        assert!(!root.join("table.bin").exists());
-        for name in ["../escape", "/absolute", "./relative"] {
-            assert!(relative(name).is_err(), "{name}");
         }
     }
 }

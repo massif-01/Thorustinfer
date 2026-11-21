@@ -278,7 +278,8 @@ def rebuild(args):
     certificates = []
     # Validate both legal expert tiles at actual N/K/E, without independently
     # changing the certified coupled route + up + down selection table.
-    from thorustinfer_build.tuning.projection_tuning import make_prim, EXACT_PASSES, TARGET
+    from thorustinfer_build.compiler.cuda import target as cuda_target
+    from thorustinfer_build.tuning.projection_tuning import make_prim, EXACT_PASSES
     import tilelang
 
     for (count, n, k), operands in sorted(experts.items()):
@@ -310,8 +311,7 @@ def rebuild(args):
                     make_prim(spec, config),
                     out_idx=[],
                     execution_backend="nvrtc",
-                    target=TARGET,
-                    pass_configs=EXACT_PASSES,
+                    **cuda_target.options(EXACT_PASSES),
                 )
                 for live in (1, 17, 512, 4096):
                     ProjectionTuner._validate(candidate, spec, config, live, actual)

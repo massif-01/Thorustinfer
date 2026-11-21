@@ -1,4 +1,4 @@
-"""Generate frozen native Chat fixtures and run serialized Orin state/quality regressions.
+"""Generate frozen native Chat fixtures and run serialized CUDA state/quality regressions.
 
 Never stop a service or touch device power/clocks. GPU ownership is an explicit
 nonblocking file lock; the caller must first release its own idle deployment.
@@ -12,6 +12,8 @@ from pathlib import Path
 import struct
 import subprocess
 import zlib
+
+from thorustinfer_build.common.paths import gpu_lock_path
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -33,7 +35,7 @@ def solid_png(red, green, blue):
     )
 
 
-def fixture_cases():
+def fixture_cases(model_name):
     def text(value):
         return {"type": "text", "text": value}
 
@@ -51,7 +53,7 @@ def fixture_cases():
         {
             "id": str(i),
             "request": {
-                "model": "qwen3.8-27b",
+                "model": model_name,
                 "messages": [{"role": "user", "content": content}],
                 "max_tokens": 32,
                 "temperature": 0,
@@ -67,7 +69,7 @@ def run(args):
     model = args.model.resolve(strict=True)
     output = args.output.absolute()
     output.mkdir(parents=True, exist_ok=False)
-    lock = ROOT / "artifacts/gpu-experiment.lock"
+    lock = gpu_lock_path()
     lock.parent.mkdir(exist_ok=True)
     with lock.open("a") as owner:
         try:
@@ -88,7 +90,7 @@ def run(args):
                         fixture=str(fixture),
                         cuda_graph=mode,
                         repetitions=1,
-                        cases=fixture_cases(),
+                        cases=fixture_cases(model.name),
                     ),
                     indent=2,
                 )

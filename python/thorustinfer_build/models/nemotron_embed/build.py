@@ -1,5 +1,6 @@
 """Build the native E8P Q4A8 Nemotron-3.5-Embed-1B execution package."""
 
+from thorustinfer_build.compiler.cuda import target as cuda_target
 from thorustinfer_build.common.paths import ROOT, gpu_lock_path, work_path
 
 
@@ -372,7 +373,7 @@ class Builder(Projections):
         )
         metadata = dict(
             schema_version=2,
-            target="sm_87",
+            target=cuda_target.architecture(),
             model="Nemotron-3.5-Embed-1B-E8P-Q4A8",
             chunk_tokens=self.capacity,
             max_context=self.capacity,
@@ -391,7 +392,7 @@ class Builder(Projections):
             embedding=spec,
         )
         package = dict(
-            target="sm_87",
+            target=cuda_target.architecture(),
             architecture="nemotron_embed",
             compute_policy="int8_quality",
             config_signature=signature(self.config),

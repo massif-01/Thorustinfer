@@ -309,7 +309,6 @@ impl HostPool {
                 bytes,
                 used: bytes,
                 handle: None,
-                native: None,
             });
             bank.remember(&descriptor)?;
             snapshot.bytes += state.iter().map(|p| p.range.bytes).sum::<usize>();
@@ -430,15 +429,7 @@ mod tests {
 
     #[test]
     fn cpu_capture_preserves_roles_offsets_and_weak_replica_identity() {
-        for backend in [
-            thorustinfer_device::Backend::Cuda,
-            thorustinfer_device::Backend::Ascend,
-        ] {
-            capture_lifecycle(backend);
-        }
-    }
-    fn capture_lifecycle(backend: thorustinfer_device::Backend) {
-        let owner = DeviceOwner::new(backend, 0);
+        let owner = DeviceOwner::new(thorustinfer_device::Backend::Cuda, 0);
         let kv = Rc::new(Allocation {
             owner,
             id: allocation_id().unwrap(),
@@ -446,7 +437,6 @@ mod tests {
             bytes: 128,
             used: 17,
             handle: Some(9),
-            native: Some(Rc::new(vec![73u8; 17])),
         });
         let state = Rc::new(Allocation {
             owner,
@@ -455,7 +445,6 @@ mod tests {
             bytes: 64,
             used: 64,
             handle: None,
-            native: Some(Rc::new((0..64u8).collect::<Vec<_>>())),
         });
         let piece = |allocation: Rc<Allocation>, name: &str, offset, bytes| Piece {
             allocation,
@@ -472,12 +461,11 @@ mod tests {
         let mut read = |regions: &[ReadRegion], output: &mut [u8]| {
             calls.set(calls.get() + 1);
             for (a, source, dest, bytes) in regions {
-                let data = a
-                    .native
-                    .as_ref()
-                    .unwrap()
-                    .downcast_ref::<Vec<u8>>()
-                    .unwrap();
+                let data = if a.handle.is_some() {
+                    vec![73u8; 17]
+                } else {
+                    (0..64u8).collect()
+                };
                 output[*dest..dest + bytes].copy_from_slice(&data[*source..source + bytes]);
             }
             Ok(())
@@ -538,7 +526,6 @@ mod tests {
                     bytes: d.bytes,
                     used: d.used,
                     handle: Some(10),
-                    native: None,
                 }))
             })
         };
@@ -555,7 +542,6 @@ mod tests {
                 bytes: d.bytes,
                 used: d.used,
                 handle: Some(10),
-                native: None,
             })))
             .is_err()
         );
@@ -568,7 +554,7 @@ mod tests {
             &second.kv[0].allocation
         ));
         assert_eq!(materializations.get(), 1);
-        let foreign = DeviceOwner::new(backend, 1);
+        let foreign = DeviceOwner::new(thorustinfer_device::Backend::Cuda, 1);
         assert!(host.restore_shared(foreign, materialize).is_err());
         assert!(
             bank.materialize(foreign, |_, _| panic!("foreign DMA"))

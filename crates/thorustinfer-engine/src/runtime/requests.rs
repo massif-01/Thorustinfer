@@ -32,7 +32,7 @@ pub struct GenerationInput {
     pub prefix_hints: Vec<usize>,
 }
 
-pub(crate) struct RequestState {
+pub struct RequestState {
     pub(crate) core: RequestCore,
     media: Media,
     warm: super::speculation::PrefillWarm,
@@ -60,6 +60,11 @@ impl std::ops::DerefMut for RequestState {
     }
 }
 impl RequestState {
+    pub fn computed_prompt_tokens(&self) -> usize {
+        self.core
+            .offset
+            .saturating_sub(self.prefix_statistics().cached_tokens)
+    }
     pub fn prefix_statistics(&self) -> &crate::prefix::Statistics {
         &self.prefix.statistics
     }

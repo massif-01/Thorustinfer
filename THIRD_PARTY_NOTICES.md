@@ -2,7 +2,7 @@
 
 ## Upstream Orinfer
 
-thorustinfer 0.2.0 is derived from [iMMIQ/orinfer](https://github.com/iMMIQ/orinfer).
+thorustinfer 0.2.1 is derived from [iMMIQ/orinfer](https://github.com/iMMIQ/orinfer).
 The upstream baseline is commit
 [`b5ce33d5c04d244b292c5f7866d79b2e0cb1165d`](https://github.com/iMMIQ/orinfer/commit/b5ce33d5c04d244b292c5f7866d79b2e0cb1165d).
 The Orinfer-derived engine and its modifications are licensed under
@@ -24,15 +24,17 @@ retain their own copyright notices and licenses.
 
 - **2026-11-21:** Added native Responses and Messages HTTP endpoints, token counting and client-side tool replay in the 0.2.0 release.
 
+- **2026-11-21:** Scoped the release to CUDA on Thor and retained the DeepSeek model reference sources in a separate directory.
+
 ## Corresponding source for the distributed runtime
 
-Distribute `thorustinfer-0.2.0-source.tar.xz` together with
-`thorustinfer-0.2.0-linux-aarch64.tar.xz`, in the same delivery directory,
+Distribute `thorustinfer-0.2.1-source.tar.xz` together with
+`thorustinfer-0.2.1-linux-aarch64.tar.xz`, in the same delivery directory,
 download location or on the same medium. The source archive contains the
 modified project, vendored build dependencies, CUTLASS headers and build
 instructions in `BUILD.md`.
 
-If you received only the runtime, obtain **`thorustinfer-0.2.0-source.tar.xz`
+If you received only the runtime, obtain **`thorustinfer-0.2.1-source.tar.xz`
 from the person or organization that supplied that runtime**, or from the same
 delivery location. Give the supplier the exact SHA-256 recorded in your
 runtime's `licenses/CORRESPONDING-SOURCE.sha256`. To verify the archive,
@@ -50,35 +52,14 @@ Selected test vectors and adapted test scenarios originate from
 License. The pinned revision, source test names and adaptations are recorded in
 `fixtures/ollama/cases.json`; the full license is in `fixtures/ollama/LICENSE`.
 
-The offline compiler image uses PyTorch and TorchVision built for Jetson by
-[our PyTorch fork](https://github.com/iMMIQ/pytorch). The build profile records the
-upstream revisions, NVIDIA toolchain image, and pinned dependencies.
-`tools/build/jetson_wheels.json` pins the release artifacts and SHA256 values.
-The wheels retain their upstream BSD licenses and bundled third-party notices.
+The offline compiler uses PyTorch and TorchVision from the official PyTorch CUDA 13.0 aarch64 wheel index. Their URLs and hashes are recorded in `tools/environments/cuda/uv.lock`. The wheels retain their original licenses and notices.
 
 The Engram tokenizer-normalization and addressing rules in
-`python/thorustinfer_build/models/deepseek_v41/export_engram.py`, the DSv4.1 chat template and
+`reference/deepseek-v41/python/thorustinfer_build/models/deepseek_v41/export_engram.py`, the DSv4.1 chat template and
 `fixtures/chat/deepseek-v41.json`, the DeepSeek image geometry and
 `fixtures/vision/deepseek-v41.json` are adapted from DeepSeek's V4.1
 reference inference implementation, Copyright (c) 2023 DeepSeek, under the MIT
-License. The full license is in `python/thorustinfer_build/models/deepseek_v41/LICENSE`.
-
-The A2 offline compiler uses [TileLang-Ascend](https://github.com/tile-ai/tilelang-ascend),
-Copyright (c) Tile-AI, under the MIT License. The A2 projection and vector
-implementations use its public programming model and examples as references;
-generated AOT libraries include its templates. The license is retained in
-`kernels/ascend/LICENSE.tilelang`. The compiler image pins the wheel
-and its SHA256; CANN and Catlass retain their upstream notices in that image.
-
-The CANN 9.2 HCOMM Graph registry ABI declaration in
-`crates/thorustinfer-engine/native/ascend/hccl_graph_registry_abi.h` is adapted from
-[CANN HCOMM v9.2.0](https://gitcode.com/cann/hcomm/tree/v9.2.0),
-Copyright (c) 2025 Huawei Technologies Co., Ltd., under the CANN Open Software
-License Agreement Version 2.0. Its full license is retained in
-`kernels/ascend/LICENSE.cann`. The optional Ascend adapter uses this
-declaration solely with the installed Huawei CANN runtime. Native HCOMM
-methods and resources remain provided by that runtime.
-
+License. The full license is in `reference/deepseek-v41/python/thorustinfer_build/models/deepseek_v41/LICENSE`.
 
 The Thor NVFP4 backend uses NVIDIA CUTLASS headers (4.1.0 as carried in the
 pinned TileLang build wheel), BSD-3-Clause. The CUTLASS GEMM configuration in

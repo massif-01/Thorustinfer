@@ -319,7 +319,7 @@ async fn health(State(state): State<Service>) -> Response {
         "image_limits":{"history_tokens":state.vision.as_ref().map(|v|v.max_features),"tokens_per_image":state.vision.as_ref().and_then(|v|v.max_image_tokens),"request_body_mib":state.limits.request_body_mib},
         "chat_capabilities":{"streaming":true,"default_stream":state.default_request_params.get("stream").and_then(Value::as_bool).unwrap_or(false),"max_choices":1,
             "response_formats":["text","json_object","json_schema"],"constraint_backend":"llguidance",
-            "tools":{"function":state.codec.tools_supported,"strict":state.codec.tools_supported,"required":state.codec.tools_supported,"incremental_arguments":state.codec.tools_supported},
+            "tools":{"function":true,"strict":true,"required":true,"incremental_arguments":true},
             "logprobs":true,"max_top_logprobs":20,"logit_bias":true,"stored_completions":false,
             "images":state.vision.is_some(),"video":false,"audio":state.codec.audio.is_some(),"default_max_completion_tokens":output_limit,
             "thinking_token_budget":true,"chat_template_kwargs":true,"prompt_cache":{"key":true,"retention":["in-memory","24h"],"persistent":false,"ttl_guaranteed":false}},

@@ -86,41 +86,22 @@ curl http://127.0.0.1:8088/v1/chat/completions \
 | Qwen3.5-4B | 开启 | `1 / 0.95 / 20 / 1.5` | 8192 |
 | Index-Translate-2B/9B/35B | 关闭 | `0 / 1 / 0 / 0`（贪心） | 1024 |
 | Qwen3-ASR-1.7B | 关闭 | `0 / 1 / 0 / 0`（贪心） | 8192 |
-| DSv4.1 | 关闭 | `1 / 1 / 0 / 0` | 非思考 8192；思考 65536；思考且 `reasoning_effort=max` 为 131072 |
 
-Qwen3.8 和 Qwen3.5-4B 关闭 thinking 时，未显式提供的采样参数使用 `temperature=0.7、top_p=0.8、top_k=20、presence_penalty=1.5`。thinking 模式下，`generation_config.json` 中显式提供的采样和惩罚值覆盖模型推荐值；其他模型继承本模型的生成配置，缺失值使用通用默认值。`do_sample=false` 采用贪心语义；Index 使用官方翻译客户端的贪心默认值，DSv4.1 使用下面的 DeepInfer 策略。repetition_penalty 默认 1，frequency_penalty 默认 0。`top_k=0/-1` 都表示关闭截断。
+Qwen3.8 和 Qwen3.5-4B 关闭 thinking 时，未显式提供的采样参数使用 `temperature=0.7、top_p=0.8、top_k=20、presence_penalty=1.5`。thinking 模式下，`generation_config.json` 中显式提供的采样和惩罚值覆盖模型推荐值；其他模型继承本模型的生成配置，缺失值使用通用默认值。`do_sample=false` 采用贪心语义；Index 使用官方翻译客户端的贪心默认值。repetition_penalty 默认 1，frequency_penalty 默认 0。`top_k=0/-1` 都表示关闭截断。
 
 这些参数分别依据 [Qwen3.8](https://huggingface.co/Qwen/Qwen3.8-27B#best-practices)、[Flash Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next#best-practices)、[Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B#best-practices) 的通用任务建议，以及 [Index 官方客户端默认配置](https://huggingface.co/IndexTeam/Index-Translate-2B#default-settings)。任务专用的编码或推理采样参数通过请求或部署默认值指定。
 
-DSv4.1 A2 的服务默认与 [DeepInfer SamplingParams](https://github.com/deepseek-ai/DeepInfer/blob/main/deepinfer/sampling_params.py) 的采样配置一致：`temperature=1、top_p=1`、关闭 top-k、不施加重复惩罚、遇到 EOS 正常结束。旧模型文件中的 greedy 默认值也由前端采用此策略，无需修改已发布权重。部署时可用 `--default-request-params` 覆盖，客户端显式提供的参数优先。
+HTTP 与 JSONL batch 共用跨步输出流水。引擎先提交已接受 token 的请求状态，下一轮设备计算期间处理上一包的文本解码、工具参数、概率报告和输出发送；每个请求最多保留一包。普通 decode 和混合文本包共用这条路径。首包、EOS、生成上限、grammar 完成及带自定义 `stop` 的请求即时处理；新请求准入、媒体编码、完成回收前排空已有输出。取消、错误及关闭时保持 owner 的完成和回收顺序。
 
-包含设备采样能力的 A2 执行包在温度 `1e-5..=2`、`top_p=1、top_k=0`、无惩罚及 bias、当前无需 grammar mask 且未请求概率报告时，普通 decode 和 DSpark 验证共享 NPU 采样。其他请求继续使用完整 logits；混合 batch 只读回这些请求的词表。首 token 和 prefix 缓存保留原始模型输出。设备采样以 seed、生成位置和全局 token ID 固定随机身份，同 seed 的具体输出可与旧 CPU 算法不同。未包含该能力的旧执行包继续使用原采样路径。
-
-声明 `processed_local/processed_merge` 的 A2 执行包还支持上述参数下的 grammar mask、`logprobs` 和最多 20 项 `top_logprobs`，并支持温度 0。CPU 按请求快照准备每个 target 位置的 mask，与本轮模型计算重叠；NPU 执行 masked argmax/采样及概率统计，每个 rank 每行只返回 48 个数。TP 汇总使用各分片的 log-sum-exp 统计计算完整词表概率。DSpark 仅提交实际接受前缀及首个拒绝位置的 parser 和概率记录，完成后的尾部不再推进请求状态。没有约束或概率报告的请求继续使用原有采样程序。
-
-离线通过 `thorustinfer_build.models.deepseek_v41.sampling --processed` 扩展已有设备采样计划，再重打包并安装执行包；权重内容保持不变。新增算子使用同一动态行模板覆盖并发及验证长度。`/health.scheduler_statistics` 的 `sampling_mask_rows`、`sampling_report_rows` 记录设备处理的行数，`sampling_prepare_s` 记录快照准备的 CPU 用时；该用时可能与设备执行重叠。`mtp_budget_calls/mtp_budget_s` 记录 DSpark 自动预算决策的 CPU 成本。
-
-HTTP 与 JSONL batch 共用跨步输出流水。引擎先提交已接受 token 的请求状态，下一轮设备计算期间处理上一包的文本解码、工具参数、概率报告和输出发送；每个请求最多保留一包。普通 decode、混合文本包与 DSpark 共用这条路径，DSpark 从草稿计算开始执行后处理。首包、EOS、生成上限、grammar 完成及带自定义 `stop` 的请求即时处理；新请求准入、媒体编码、完成回收和 A2 Graph 准备前排空已有输出。取消、错误及关闭时保持 owner 的完成和回收顺序。
-
-`/health.output_pipeline_statistics` 提供延迟包数、token 数、维护回调和边界排空次数，以及后处理 CPU 用时。`maintenance_postprocess_s` 表示维护回调内的 CPU 用时，包含 Graph 准备前的排空，不能直接视为设备耗时的减少。诊断对照可在启动前设置 `THORUSTINFER_ASYNC_OUTPUT=0` 使用即时输出。采样、DSpark 接受前缀、KV 和 Graph 的状态提交仍保持现有依赖顺序。
-
-A2 的模型、设备采样和小结果读回按计算流顺序提交，读回完成事件统一确认其前置计算。草稿分数与 token ID 合并读回。资源回收使用同一条流上最后一个已完成事件的硬同步确认此前提交完成；无关传输流继续持有自己的资源，跨流通用下载仍确认两条流。事件查询本身不能代替完成确认，失败时保留原有隔离和清理顺序。
-
-声明 `coupled_draft` 的执行包在 DSpark Markov head 内复用 target 同一生成位置的 Gumbel 随机数，按顺序推进草稿条件，并复用现有匹配前缀提交与状态恢复。target 保持请求的采样概率律；草稿无需传回完整概率表。温度 0、当前需要 grammar mask 以及不满足设备采样条件的请求使用贪心草稿。离线通过 `thorustinfer_build.models.deepseek_v41.sampling --couple-draft` 扩展已具备 target 采样能力的计划，所有并发与草稿长度共享一个动态 Markov 算子。
-
-实验性概率拒绝采样通过 `THORUSTINFER_A2_DSPARK_SAMPLING=rejection` 启用，默认值为 `coupled`。执行包须先通过 `thorustinfer_build.models.deepseek_v41.sampling --rejection` 扩展、重新打包并安装，权重保持不变。该路径复用 Markov head 的原始 logits，按 owner 保存有界草稿分布，在设备上计算接受率与正残差分布；TP rank 仅交换归一化及候选 token 的统计。草稿、接受与纠正采样使用独立的随机数域，每轮计数与普通 decode 分离，丢弃草稿的随机数在后续轮次不复用；验证、回滚和状态提交沿用公共流程。仅普通设备温度采样使用该候选；含约束、概率报告或其他采样处理的 decode packet 保留既有路径。数值错误及空残差显式报错，不添加概率下限。启用前应比较相同历史下的接受长度、整轮耗时及实际请求性能。
+`/health.output_pipeline_statistics` 提供延迟包数、token 数、维护回调和边界排空次数，以及后处理 CPU 用时。`maintenance_postprocess_s` 表示维护回调内的 CPU 用时，包含 Graph 准备前的排空，不能直接视为设备耗时的减少。诊断对照可在启动前设置 `THORUSTINFER_ASYNC_OUTPUT=0` 使用即时输出。采样、草稿接受前缀、KV 和 Graph 的状态提交仍保持现有依赖顺序。
 
 thinking 默认值见上表；`enable_thinking=true` 或非 `none` 的 `reasoning_effort` 可显式开启，思考文本位于扩展字段 `reasoning_content`。`none` 关闭，`minimal/low` 映射 checkpoint 的 `low`，`medium` 保留，`high/xhigh/max` 映射 `xhigh`；显式 `enable_thinking=false` 可关闭。模型原生模板要求存在用户消息，system/developer 指令应放在开头。
 
-DSv4.1 使用本模型的 effort 编码：开启 thinking 后默认 `high=75`，`minimal/low=50`，`max/xhigh=100`。
-
-`chat_template_kwargs` 接受对象或 `null`，兼容 DSH、vLLM 客户端的模板参数。嵌套的 `enable_thinking`（或 `thinking`）、`reasoning_effort` 和 `thinking_token_budget` 与对应顶层控制一致；同名非空顶层值优先。`preserve_thinking` 控制模板中的历史推理保留，其余自定义变量传给模型模板；消息、工具、生成边界和运行时控制由服务端绑定。请求中的嵌套 thinking 设置会覆盖部署默认值中的顶层或嵌套 thinking 设置，模板默认变量按键补齐；显式 `chat_template_kwargs: null` 清除默认模板变量。thinking 开关必须为布尔值。接入配置见 [DeepSeek Harness](deepseek-harness.md)。
+`chat_template_kwargs` 接受对象或 `null`，兼容 DSH、vLLM 客户端的模板参数。嵌套的 `enable_thinking`（或 `thinking`）、`reasoning_effort` 和 `thinking_token_budget` 与对应顶层控制一致；同名非空顶层值优先。`preserve_thinking` 控制模板中的历史推理保留，其余自定义变量传给模型模板；消息、工具、生成边界和运行时控制由服务端绑定。请求中的嵌套 thinking 设置会覆盖部署默认值中的顶层或嵌套 thinking 设置，模板默认变量按键补齐；显式 `chat_template_kwargs: null` 清除默认模板变量。thinking 开关必须为布尔值。
 
 `thinking_token_budget` 限制本轮初始思考段的 token 数，支持 0；到达上限时解码强制选择 `</think>`，随后继续回答或调用工具。结束标记仅计入 completion。预算自动缩小到总输出上限减 2，为结束标记和至少一个回答 token 留空间；开启 thinking 且指定此参数时，总输出预算至少为 2。该预算在 thinking 开启时生效。限制是请求私有状态，MTP 的草稿和 target 共同遵守。无惩罚、无概率报告的 greedy 请求在 GPU argmax 满足约束时直接复用结果；预算耗尽时可直接选择唯一的结束标记。其他约束选择保留 CPU 回退，随机采样保持相同目标分布。effort 控制思考倾向，`thinking_token_budget` 提供硬上限。
 
 `chat_template_kwargs.thinking_budget` 是同一硬预算的兼容别名，支持 Estuary 的 Messages 转换。顶层 `thinking_token_budget` 优先；没有顶层值时，两个嵌套别名若同时给出须相同。请求任一别名均覆盖部署默认预算，`0` 与 `null` 保留显式语义。
-
-DSv4.1 编码区分 checkpoint 模板产生的控制标记和正文。用户、工具结果、历史工具参数及工具 schema 中同名的特殊标记按普通文字编码。流式输出与 thinking 硬预算以实际控制 token ID 识别边界，普通 token 拼出的 `</think>` 或 DSML 标签保留为文字。图片占位继续由媒体前端生成并校验。
 
 ### 内置协议与可选 Estuary 网关
 
@@ -128,7 +109,7 @@ DSv4.1 编码区分 checkpoint 模板产生的控制标记和正文。用户、�
 
 Estuary 节点选用 `openai` provider，上游填写 thorustinfer 的 `/v1` 地址。该模式沿用网关的通用负载和近似前缀路由；thorustinfer 的 `/metrics` 使用自身指标名，真实缓存事件与 vLLM 专用路由协议另行对接。多模态 token ID 不构成图片缓存身份。
 
-默认输出预算见上表，并缩小到剩余上下文容量；可用 `max_tokens` 或 `max_completion_tokens` 之一指定。此处为 Chat API 的输出预算；DeepInfer 底层构造器的默认值为 16 tokens，调用方传入已编码 prompt，thinking 由外部模板决定。本服务的 thinking 开关沿用上面的请求控制。DSv4.1 的输出预算按最终 thinking 开关和请求的 `reasoning_effort` 选择，与 [DeepSeek 官方 Chat API](https://api-docs.deepseek.com/zh-cn/api/create-chat-completion/) 的默认值一致；`xhigh` 等其他已支持的思考强度使用 65536。预算包含思考和正文，不继承 `generation_config.json.max_new_tokens`。ASR 转录入口使用 8192 输出预算，以容纳长录音。提示、历史、图片、thinking 和输出合计计入上下文容量；显式预算超出模型包容量时在准入前返回 400。HTTP body 上限默认 32 MiB，通过 `--request-body-mib` 调整。
+默认输出预算见上表，并缩小到剩余上下文容量；可用 `max_tokens` 或 `max_completion_tokens` 之一指定。此处为 Chat API 的输出预算。
 
 上下文溢出返回 `error.code=context_length_exceeded`，客户端可据此压缩历史并重试；其他无效参数仍为 `invalid_request`。
 
@@ -187,8 +168,6 @@ thinking 可与 JSON 输出组合，正文仍受约束。MTP 的 target 和 draf
 
 auto 调用在宽松模式下沿用原生 XML 协议。未知函数、缺失参数或错误参数类型仍作为调用交给客户端，客户端应校验并返回 `role=tool` 错误结果，让模型重试；工具由客户端执行。XML 参数按声明类型转换，无法转换的值保留为字符串。语法损坏到无法辨认函数的输出仍报错。输出预算用尽时返回 `finish_reason=length` 并保留已生成的调用前缀，流式与非流式参数一致；客户端仅执行完整且通过参数校验的调用。回传历史中存在无效 JSON 对象参数时，原始字符串在原生模板中以 `__thorustinfer_raw_arguments` 参数完整保留。
 
-DSv4.1 部门部署的安装、准入、长请求期限与回滚配置见[生产部署说明](deepseek-v41-production.md)。
-
 ### OpenCode 与 Pi
 
 [OpenCode 配置](../examples/opencode.json)使用 `@ai-sdk/openai-compatible` 和默认编码 agent，启用自动压缩，声明图片、工具、thinking 及 `reasoning_content` 历史回传；agent 按客户端自身的运行策略推进。将其复制为项目中的 `opencode.json`，按服务的 `--model` 选择对应模型：
@@ -199,15 +178,6 @@ opencode run --model thorustinfer/qwen-flash-next --variant low '检查并修复
 ```
 
 Qwen 示例默认关闭 thinking；low/medium/high 分别使用 512/1024/2048 思考 token 上限，总输出上限为 8192。工具权限沿用 OpenCode 默认设置。
-
-DSv4.1 使用原生 DSML 工具协议，需要模型元数据声明 `chat_format=deepseek_v41`；旧模型可按[模型包说明](model-packages.md)仅更新前端。服务的 `--model` 与客户端模型 ID 使用 `deepseek-v4.1`：
-
-```bash
-opencode run --model thorustinfer/deepseek-v4.1 '检查并修复当前项目的测试失败'
-opencode run --model thorustinfer/deepseek-v4.1 --variant off '检查并修复当前项目的测试失败'
-```
-
-该条目声明文本和图片输入；图片需要匹配视觉权重及执行包，默认开启 thinking，low/high/max 分别对应官方模板的 50/75/100 倾向值，off 关闭。倾向值不构成思考 token 硬上限；需要硬上限时传入 `thinking_token_budget`。context 与 output 应按实际部署容量设置。
 
 [Pi 配置](../examples/pi-models.json)对应 `earendil-works/pi`。将 provider 合并到 Pi agent 目录中的 `models.json`，默认目录为 `~/.pi/agent`；配置使用 `openai-completions`，可通过 `/model` 和 `/thinking` 切换模型与思考级别：
 
@@ -255,9 +225,7 @@ Flash Next 的主模型支持 2048／4096 token 大分块，MTP 预热保持 512
 
 探索按较小合法宽度优先，完成三个热样本后再测更深候选；已有成本超过 512 次同一工作形状执行未更新时，可用一次有预算的执行刷新，保留历史样本；普通 decode 的基线也按相同周期刷新。接受率与候选收益每轮重新计算，刷新周期只约束闲置成本的重测。草稿游标存在滞后时，可用实际收益额度执行一次最浅深度的接受率复核，由实际风险额度控制复核频率，避免固定等待 token 数使旧拒绝率冻结；复核只按每个 owner 保证提交一个 target token 预留风险，不使用旧接受率虚构额度；即使完美接受也无法盈利的已测深度不做接受率复核。校准需要足够剩余输出，预计损失还须小于剩余工作可能节省的时间。校准和重测均按相对普通 decode 的预计损失预留，避免已准备的盈利路径因缺少整轮额度而中断校准；实际超支形成欠款，后续探测等待额度恢复。普通 decode 按实际耗时的 2% 积累探索额度，投机执行相对普通 decode 的实际收益或损失更新同一账本。普通路径已有热态基线时，后续有准备计时的恢复轮次还会扣除相对该基线的实际额外耗时，覆盖普通 Graph 被挤出后的恢复成本；扣款使用整轮墙钟差额，避免重叠计时重复计费。首次普通基线建立不扣恢复费用。
 
-每个已加载模型只有一个收益余额和启动支出记录，batch、context、采样与角色变化共享模型实际赚到的额度及已有欠款；各形状的计时样本继续隔离。CUDA 全模型启动探索池累计最多一个 `target_tpot_ms`；A2 按公共四轮校准窗口最多四个 `target_tpot_ms`，仅为尚未取得三个热样本的成本校准补足实际亏损，按实际支出递减；已测形状的冷路径重入、接受率复核和后续亏损只使用实际收益余额，保留超支欠款；选择候选本身不发放或占用额度。启动池用尽后，普通执行额度和实际投机收益可偿还欠款、支持新形状校准。请求成员变化、成本表逐出和 Graph 重建均保留同一账本。成本表最多保留 256 个 cohort，账本保持固定大小。共享调度标记固定到请求结束，用于隔离计时身份；尾部只剩一个 decoder 时仍保留该身份。
-
-CUDA 与 A2 共用条件接受率 EMA、热态采样、收益选择和模型级实际损失账本。A2 提供并行草稿档位、真实可采用前缀的完美接受进度及 direct／replay 分阶段成本；其 Markov 草稿无需串行追赶，普通执行推进或新 owner 缺少接受历史时可参与有预算的接受率复核。算子、缓存就绪和状态恢复仍由各后端执行器管理。
+每个已加载模型只有一个收益余额和启动支出记录，batch、context、采样与角色变化共享模型实际赚到的额度及已有欠款；各形状的计时样本继续隔离。CUDA 全模型启动探索池累计最多一个 `target_tpot_ms`。启动池用尽后，普通执行额度和实际投机收益可偿还欠款、支持新形状校准。请求成员变化、成本表逐出和 Graph 重建均保留同一账本。成本表最多保留 256 个 cohort，账本保持固定大小。共享调度标记固定到请求结束，用于隔离计时身份；尾部只剩一个 decoder 时仍保留该身份。
 
 实现参考 [SmartSpec 的 goodput 成本与收益模型](https://arxiv.org/abs/2406.14066)、[vLLM 的 batch／深度分档](https://docs.vllm.ai/en/latest/features/speculative_decoding/dynamic_speculative_decoding/)，以及 [SGLang 的策略与运行时资源分离](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/speculative/adaptive_runtime_state.py)。构建方法见[模型工具](../tools/model/README.md)。
 
@@ -331,71 +299,21 @@ prefill 按实际耗时扣减执行额度，各块按实际占用时间公平计
 
 前处理自动并发为可用 CPU 数除以 4，限制在 1–8，再受每个任务 256 MiB 的预算估计约束；实际请求仍按原始内存估算获取许可。`/health.preparation_statistics` 发布实际并发、请求数及内存等待、任务等待、模板前准备、模板渲染、token 编码和总准备时间。`prepare_s` 是阻塞 CPU 任务的执行总时长，包含内部阶段；内存与任务等待另计。请求的 `preparation` 日志记录同一组时间；这些累计时间包含并发重叠。
 
-DeepSeek 前端在每个模型 worker 内使用 64 MiB 的有界文本编码缓存，独立于图片缓存及在途请求预算。缓存仅复用控制 token 之间完整、原文完全相同且至少 1 KiB 的文本区段，保留控制 token 身份及原始 BPE 边界；变更文本重新编码。`/health.tokenization_cache` 显示字节预算、驻留、命中、复用 token 和淘汰数。此缓存持有当前 tokenizer 的编码结果，随模型 worker 一同释放。
+HTTP 在加载模型前绑定监听地址，端口被占用时立即退出；模型和预热完成后开始处理 HTTP。就绪探针使用 `/health` 的 HTTP 200，TCP 连通只表示监听地址已绑定。正常退出及启动失败会清理本服务创建的 Unix socket；已有 socket 绑定失败时保留原文件。
 
-缓存未命中时，若只有一个至少 1 KiB 的长区段，或全部为短区段，直接在已有的有界预处理任务内编码；多个长区段保留 tokenizer 的批量并行编码。两种调度方式保持相同的文本区段和 token 边界。
+`serve`、`worker` 和 `batch` 可通过 `--kv-offload-mib 65536` 启用总计 64 GiB 的 CPU prefix 状态缓存，默认 `0` 关闭。CUDA 使用单 worker 的全局预算。按共享 bank 的实际容量去重，并预留历史、索引和输出头等元数据。内存按需分配；pinned DMA 缓冲另受原生 session 的既有上限约束。`--prefix-cache-mib` 控制每张卡上的设备缓存；设置为 `0` 时可以直接保存到 CPU 层。
 
-A2 启用 DSpark 时，`scheduler_statistics.speculation` 同步发布模型级累计草稿、接受、提交计数及分段耗时。草稿、验证和恢复计时包含设备等待与结果回读，采样计时记录 CPU 验证与提交；各请求日志中的整包耗时不能跨请求直接累加。通过同一健康快照的计数差值分析稳定 decode 窗口。
+CUDA 使用物理页身份、引用、发布、写时复制、CPU bank 和设备副本目录。prefix 缓存与活动请求引用同一份完整的不可变 KV 物理分配，发布缓存及设备命中通过映射复用，保持请求虚拟地址和已有 Graph 地址稳定。未满分配的 KV 尾部紧凑保存到端点 bank；同层父检查点仍在缓存时，续存复用其不可变尾部，仅复制新增 KV。每条尾部最多保留 8 个片段，超过后重新紧凑保存，限制复制调用和旧 bank 保留。完整物理分配形成后，裁掉被取代的尾部片段。活动尾部保持可写，恢复时只复制有效尾部字节。续写共享分配前执行写时复制，只保存已提交字节；新的未提交后缀清零。SWA、循环窗口、压缩残留和 MTP 等可变状态按模型声明每次独立保存，恢复完整状态后继续执行。物理分配粒度由设备原生 API 决定；预算按实际引用的完整物理容量去重计费，CPU backing 只保留有效字节。
 
-A2 的 `scheduler_statistics.batch_execution` 按完成的 TP packet 计数，每包计一次。`graph_hits` 记录已驻留整包 Graph 的 replay，`dynamic_graph_captures` 记录本轮新捕获，`graph_misses` 记录未命中已驻留整包 Graph 的执行。`shared_graph_hits` 记录使用公共片段 Graph 的 packet，可能同时计入 `direct_iterations`；`shared_graph_captures` 记录新捕获的片段。`capture_s` 包含整包捕获的协调准备及 warmup，或单独的片段捕获准备；`direct_s` 与 `replay_s` 是提交后的完成耗时，准备另计。普通、草稿和验证共用这些统计，不能再按 rank 或 owner 乘算。A2 提供上述执行统计及 `graph_invalidations`；其他公共字段保留默认值，例如 `graph_evictions=0` 不表示已验收无淘汰。
+设备缓存淘汰时，预算允许的快照移到 CPU；CPU 层满时按现有缓存效用策略回收。查询两层合法前缀，同长时优先设备。CPU bank 用弱引用跟踪设备副本：活动请求仍引用设备页时直接复用，设备页已回收时上传一次并供后续命中共享。CPU 共享 bank 保留不可变数据，以合并的有效字节区间跟踪不可变切片；重叠快照和同批次重叠切片只下载缺失部分。CUDA 使用区间去重、设备副本查询及完成后发布逻辑，原生适配器负责分配和搬运。失败的下载不更新有效区间，失败的上传不登记设备副本，可安全重试。传输通过有界 pinned 分块，完成事件持有 DMA 的全部原生资源。卸载和恢复在调度边界完成，活动请求的计算与 KV 保留在设备上，准入同时保留后续增长及共享尾页复制所需额度。
 
-A2 普通 decode、草稿和验证形状在所有 rank 累计成功执行两次后统一捕获 Graph，交替出现的形状沿用累计次数；prefill 保持八次阈值。草稿成本模型从实际 Graph replay 学习普通 decode、草稿和验证的稳态成本，直接执行仍更新接受率与准备次数。Graph 准备和直接执行的实际耗时完整计入请求及调度统计。
+前缀索引由同一个 Rust 分层控制器管理，统一查询、物理 bank 去重、预算准入及统计。准入区分可直接保存、需要回收和单个计划超限，新增 payload 与元数据一起计费；单个计划超限或字节总和溢出时跳过保存，保留已有缓存。迁移时先选定设备端点，完成 CPU 保存后再移除设备索引，并保留端点的命中历史。设备适配器执行各自的物理映射、搬运和完成同步，模型适配器声明完整的 KV 与持续状态边界。
 
-`THORUSTINFER_A2_SHARED_GRAPH=1` 启用大 target packet 的公共 FFN 片段缓存。512 行及以上、decoder replay 边界之前的片段按真实行数和物理绑定复用，保留完整 fork/join；请求私有操作继续使用原地址表。整包 Graph 命中优先。所有 rank 统一选择已驻留片段，每轮最多捕获一个已执行三次的缺失片段；捕获同时受延迟预算、缓存容量及正常 workspace 以外的 256 MiB 显存余量约束。淘汰后重新累计复用次数。该选项默认关闭，使用完整请求实测决定是否启用；`--graph off` 统一关闭捕获与 replay。
-
-A2 DSpark 分别学习直接提交、公共片段 replay 和整包 replay 的执行成本；公共捕获准备单独计费。`THORUSTINFER_A2_DSPARK_POLICY_TRACE=1` 输出 `A2_SHARED_PLAN` 的行数、片段数及本轮准备耗时，以及 `DSPARK_COST` 的 `shared`、`shared_setup_s`。离线成本汇总保留三种模式，导入先验不代表本进程已经拥有相应 Graph。
-
-A2 的 `--graph off` 关闭主干、DSpark 和视觉的 Graph 捕获及 replay，并将模型中的独立分支按原计划顺序提交到同一计算 stream。权重、长上下文、prefix cache、工具协议和图片输入沿用相同实现；直接执行会增加主机提交成本。该模式用于规避和定位 Graph replay 或跨 stream 事件依赖故障。ACL 507047 表示完成事件在指定期限内尚未完成，需结合首次故障定位；发生设备故障后的团队仍会退出服务，重启进程后应用新的配置。
-
-A2 在加载 CANN 前自动安装按设备隔离的 HCOMM Graph 回调注册表，支持 CANN HCOMM 9.2.0。单进程多卡可以各自淘汰、重建 Graph，设备内重复的 modelId 分别注册和清理；原生 modelId、AICPU 元数据及通信参数保持原有语义。兼容组件随引擎编译，在线从密封匿名内存加载，无需编译器、额外部署文件或修改系统 CANN。组件在进程内保留至退出；HCOMM 已提前加载或组件 ABI 不匹配时，启动返回明确错误。`validate-hccl` 包含改变输入的 replay，以及各 rank 分别保留 1–4 个 Graph 的 12 轮捕获、执行和回收检查。 引擎及内置组件的 glibc 最低版本为 2.34；离线构建会检查内置组件的 ELF 版本依赖。
-
-A2 执行包可通过 `batch.verification_capacity` 声明自动草稿分配的 decoder 验证行预算，包含各 owner 的 anchor；离线构建和在线加载校验其处于 target 与输出容量范围内。`thorustinfer_build.models.deepseek_v41.publication --verification-capacity N` 复用已有动态计划发布该声明，行数调度继续选择原有计算和通信路径。发布前需完成对应容量下的验证、接受前缀恢复及请求隔离验收。未声明的执行包沿用首次跨 rank 行交换之前的保守预算；没有行交换时使用 target 容量。`--max-speculative-tokens N` 进一步限制 decoder 验证行预算；混合 prefill 行数由公共 packet 容量和调度预算约束，独立 prefill 使用原有容量。状态 journal 汇总本包各 owner 的保存或恢复拷贝，通过同一 stream 提交并统一等待完成。
-
-A2 自动草稿成本模型复用邻近行数的测量；向上预测限定在已测行数的两倍内。更大的未知 batch 使用现有的有界探索预算校准，收益和亏损仍记入同一模型级账户。这样可以避免将小 packet 的固定启动成本按请求数放大，长期阻止较大 batch 获得实测机会。
-
-A2 草稿 Graph 按实际参与草稿的 decoder 请求估算复用次数，整包 decoder 的 deadline 继续约束准备时间。相同缓存形状的真实命中可为跨请求复用提供有界预测；新形状保留直接执行的预热。Graph 捕获收益使用相同工作量的 replay 测量，其他行数的保守价格用于执行成本预测，本地捕获通过受预算约束的探测建立价格。
-
-A2 selected INT8 attention 的离线融合复用同一 gather、QK、softmax 和 PV 计算体，支持每 rank 8/16/32/64 个 head，保留 FP32 softmax 与 BF16 probability 边界。`thorustinfer_build.models.deepseek_v41.fuse_attention --selected-int8 --min-rows N` 按实测聚合行数拆分已有 target 执行域，小行数保留原算子；草稿与普通 decode 沿用各自的计划选择。主干全行与 decoder 保留窗口分别绑定 work 表，在线只消费离线生成的计划。
-
-A2 专家 GMM 可通过 `thorustinfer_build.models.deepseek_v41.expert_fusion` 离线选择已有 target 行数区间，默认 `32..511`。gather 将完整 A8 无损拆成两行 signed INT4，复用发布的 NZ W4 bank 与原生 grouped matmul；GMM 在 FP16 部分积舍入前应用原权重 scale，后处理融合部分积合并、FP32 assist/token scale、BF16 SwiGLU 和 FP32 行量化。`--min-rows`、`--max-rows` 必须覆盖完整的已有 packet 区间；其他 packet、请求状态和权重文件沿用原契约。该计划使用显式 `w4_a4` 指令，需要支持它的引擎。执行包单独发布单位 token scale 常量及临时 workspace，权重包保持原样。
-
-`thorustinfer_build.models.deepseek_v41.fuse_ffn_collectives --plan PLAN --output OUTPUT --model-dir MODEL` 合并 sequence-parallel FFN 的四路 AllGather。行量化与路由数据打包共用原 FP32/A8 算术，收集后只拆分 scale 和路由元数据；共享专家投影与专家 gather 通过原工厂的物理行 stride 直接读取激活。构建器检查别名、后续读者和覆盖边界，保留专家行倍率及原有行数选择。新增布局和既有几何按算子族统一重建至同一源码身份；执行资产单独发布，权重和请求状态保持原契约。
-
-A2 mHC 可通过 `thorustinfer_build.models.deepseek_v41.fuse_hc --plan PLAN --output OUTPUT --model-dir MODEL` 离线融合八分片归一化与 Sinkhorn，保留 FP32 计算顺序及真实行表达式，支持 sequence-parallel 分片和 decoder 后缀。构建器复用同一个归一化宏与 Sinkhorn 计算体，每种物理容量发布一个动态入口；`--capacity-tiles FILE` 读取以容量为键的离线 tile 选择，例如 `{"256":8,"2048":32}`。该容量内的各实际 batch 和长度共享同一配置。`tests.ascend.operators.validate_hc_fused` 对已发布参考检查精确数值、尾部及变输入 Graph，`--benchmark` 复用公共 Graph 测量工具。执行资产单独发布，权重和请求状态布局沿用原契约。
-
-HTTP 在加载模型前绑定监听地址，端口被占用时立即退出；模型和预热完成后开始处理 HTTP。就绪探针使用 `/health` 的 HTTP 200，TCP 连通只表示监听地址已绑定。A2 全量常驻 CPU 表的启动可能需要数分钟，部署时为启动探针预留足够时间，例如 600 秒。正常退出及启动失败会清理本服务创建的 Unix socket；已有 socket 绑定失败时保留原文件。
-
-A2 rank 的命令使用一个共同的等待期限，`THORUSTINFER_A2_COMMAND_TIMEOUT_MS` 默认 `30000`，支持 `1..1800000` 毫秒，同时设置 ACL 同步等待期限；初始模型加载单独允许 1800 秒。rank 驱动错误、线程退出或命令超时会使当前 TP 团队失效，保留首个故障的类型和驱动错误码，后续请求无法继续使用该团队。服务故障后由进程管理器重启；调整命令期限时也应相应配置 HTTP 和停机期限。
-
-A2 的 AOT 原生库由同一 ACL 运行时按路径共享，保留至 ACL 完成退出后再卸载。AscendC 注册的 profiler 回调也在此期间保持有效，覆盖 Graph 回收及 HCCL 后台线程退出。权重、请求状态和 Graph 仍按各自的所有权释放。
-
-A2 每个 packet 在同一 worker 命令内完成 KV 增长和 Graph 缓存探测。全部 rank 已准备好时，LRU 更新随执行命令完成，forward 内部使用两轮 worker 往返；外层 workspace 预算探测单独执行。新形状、缓存分歧和 Graph 晋升仍在统一准备完成后执行，保留各 rank 的 HCCL 顺序和捕获保护。
-
-A2 DSv4.1 将请求私有状态按存活范围分配：有界 SWA/C2 状态和固定 workspace 放入 owner arena；声明为 append-only 的 KV、FP16 scale 和索引保留最大上下文的虚拟地址，物理页按实际执行位置增长。补页在 Graph 准备和执行前完成，已有地址与算子 ABI 保持稳定；prefix 恢复先映射对应的历史范围，再复制状态。同一 owner 的 KV 与索引缓冲区统一校验新增物理字节和区间，在已有访问完成后批量映射，再沿同一 stream 依序清零；全部新增页初始化完成后才返回。共享同一虚拟分配的视图按最大范围去重，保持原有页粒度计费。取消和完成请求后，等待已有访问结束再释放映射；owner 0 保留启动时的固定缓冲区，回收可增长状态的物理页。实际字节数包含设备页粒度和各 buffer 的对齐开销。
-
-A2 准入按请求的实际输入长度与声明的输出上限保留后续 KV 增长额度，物理页仍随执行进度映射。尚未映射的额度同时从物理显存和 session 余额中扣除，供新请求、prefix 快照和 Graph workspace 统一检查，避免已接收请求后续增长时与缓存争抢同一份空间。`--prefix-cache-mib` 按同一快照 bank 在各 rank 的最大物理占用计费，共享 bank 去重，CPU 输出也计入缓存预算。
-
-`serve`、`worker` 和 `batch` 可通过 `--kv-offload-mib 65536` 启用总计 64 GiB 的 CPU prefix 状态缓存，默认 `0` 关闭。CUDA 使用单 worker 的全局预算；A2 在所有 TP rank 之间划分。按共享 bank 的实际容量去重，并预留历史、索引和输出头等元数据。内存按需分配；pinned DMA 缓冲另受原生 session 的既有上限约束。`--prefix-cache-mib` 控制每张卡上的设备缓存；设置为 `0` 时可以直接保存到 CPU 层。
-
-CUDA 与 A2 共用物理页身份、引用、发布、写时复制、CPU bank 和设备副本目录。prefix 缓存与活动请求引用同一份完整的不可变 KV 物理分配，发布缓存及设备命中通过映射复用，保持请求虚拟地址和已有 Graph 地址稳定。未满分配的 KV 尾部紧凑保存到端点 bank；同层父检查点仍在缓存时，续存复用其不可变尾部，仅复制新增 KV。每条尾部最多保留 8 个片段，超过后重新紧凑保存，限制复制调用和旧 bank 保留。完整物理分配形成后，裁掉被取代的尾部片段。活动尾部保持可写，恢复时只复制有效尾部字节。续写共享分配前执行写时复制，只保存已提交字节；新的未提交后缀清零。SWA、循环窗口、压缩残留和 MTP 等可变状态按模型声明每次独立保存，恢复完整状态后继续执行。物理分配粒度由设备原生 API 决定；预算按实际引用的完整物理容量去重计费，CPU backing 只保留有效字节。
-
-设备缓存淘汰时，预算允许的快照移到 CPU；CPU 层满时按现有缓存效用策略回收。查询两层合法前缀，同长时优先设备。CPU bank 用弱引用跟踪设备副本：活动请求仍引用设备页时直接复用，设备页已回收时上传一次并供后续命中共享。CPU 共享 bank 保留各 rank 自己的数据，以合并的有效字节区间跟踪不可变切片；重叠快照和同批次重叠切片只下载缺失部分。CUDA 与 A2 共用区间去重、设备副本查询及完成后发布逻辑，原生适配器负责分配和搬运。失败的下载不更新有效区间，失败的上传不登记设备副本，可安全重试。传输通过有界 pinned 分块，完成事件持有 DMA 的全部原生资源。卸载和恢复在调度边界完成，活动请求的计算与 KV 保留在设备上，准入同时保留后续增长及共享尾页复制所需额度。
-
-两种设备的前缀索引由同一个 Rust 分层控制器管理，统一查询、物理 bank 去重、预算准入及统计。准入区分可直接保存、需要回收和单个计划超限，新增 payload 与元数据一起计费；单个计划超限或字节总和溢出时跳过保存，保留已有缓存。迁移时先选定设备端点，完成 CPU 保存后再移除设备索引，并保留端点的命中历史。设备适配器执行各自的物理映射、搬运和完成同步，模型适配器声明完整的 KV 与持续状态边界。
-
-请求完成日志中的 `host_resident_bytes` 是 CPU 层计费字节，A2 为所有 rank 合计，含保守元数据预留；`host_entries`、`host_hits`、`host_stores` 和 `host_evictions` 记录 CPU 层行为，恢复耗时计入 `restore_s`。设计参考 SGLang [radix cache](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/radix_cache.py) 的共享页与活动引用，以及 [HiCache](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/cache_controller.py)、vLLM [KV offloading](https://github.com/vllm-project/vllm/blob/main/docs/features/kv_offloading_usage.md) 的分层存储与传输完成约束。公共管理代码复用布局和所有权规则；各设备仍使用本地物理布局、传输及完成事件。
-
-A2 准入同时检查每张卡的物理空闲显存与原生 session 分配余额，并保留执行 workspace；不足时依次回收 prefix 快照和缓存的 Graph 程序，再决定是否排队。快照先规划新增 bank 并检查缓存预算和分配余量，再分配和复制；回收父快照后重新规划，避免把完整复制误算成增量复制。正常容量不足走准入等待；其他进程的显存变化或原生驱动分配失败仍可能使 worker 失效，需要重启服务。
-
-A2 HTTP/JSONL 使用 `ASCEND_COREDUMP_SIGNAL=none`，由服务处理 SIGINT/SIGTERM 并回收资源。`serve`、`worker` 和 `batch` CLI 在创建线程前默认设置该值；直接调用 Rust API 时在进程启动环境中设置。A2 检测到缺失或冲突配置时在创建 GPU worker 前报错。[CANN 环境变量说明](https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/800alpha002/apiref/envref/CANN%E7%A4%BE%E5%8C%BA%E7%89%88%208.0.0.alpha002%20%E7%8E%AF%E5%A2%83%E5%8F%98%E9%87%8F%E5%8F%82%E8%80%83%2001.pdf)说明了 trace 与业务信号捕获冲突时的配置；此设置关闭 CANN trace 的信号堆栈文件，Rust 错误报告及系统 core dump 配置继续生效。SIGINT/SIGTERM 会中断未完成请求，按 `--drain-timeout-ms` 等待 HTTP 响应及 worker 回收。
-
-A2 停机时，常驻 CPU 表等待所有读取者释放后回收，与 rank 和 bootstrap 原生资源的销毁重叠；两者完成后释放 GPU 锁。Linux 上较大的常驻表按 128 MiB 的完整页区间退还物理页，再由原 Vec 释放映射，减少大块解除映射与 NPU 队列销毁争用地址空间写锁的等待。分配器边界及非整页尾部保留到正常释放，退页建议失败时沿用正常释放。加载、行读取和计算继续使用原来的连续存储。全量常驻大 CPU 表的部署使用 `--drain-timeout-ms 120000`，为内存释放和驱动清理保留余量，外部进程管理器的强制退出期限应大于此值。
+请求完成日志中的 `host_resident_bytes` 是 CPU 层计费字节，含保守元数据预留；`host_entries`、`host_hits`、`host_stores` 和 `host_evictions` 记录 CPU 层行为，恢复耗时计入 `restore_s`。设计参考 SGLang [radix cache](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/radix_cache.py) 的共享页与活动引用，以及 [HiCache](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/cache_controller.py)、vLLM [KV offloading](https://github.com/vllm-project/vllm/blob/main/docs/features/kv_offloading_usage.md) 的分层存储与传输完成约束。公共管理代码复用布局和所有权规则；各设备仍使用本地物理布局、传输及完成事件。
 
 若启动或停机错误返回时仍有模型 worker 存活，CLI 记录错误后以退出码 1 直接终止进程，跳过会与原生线程竞争的第三方退出钩子，由操作系统回收进程资源。正常退出仍等待模型和 CPU 表完成销毁。Rust API 的 `has_live_model_workers()` 可供嵌入调用方判断后台资源是否仍在回收。
 
 启动默认检查配置签名、执行库和 kernel 的 ABI，以及权重和 CPU 表的 safetensors 结构、dtype、shape、布局和偏移边界，不计算资产内容 SHA256。`serve`、`run-model` 和 `score-model` 添加 `--verify-weights` 可校验加载的权重内容；`validate-model` 始终完整校验模型权重。检测结构合法但数值受损的权重需开启完整内容校验。
-
-A2 的共享 CPU 表与各 rank 的设备权重并行准备。常驻表使用可失败的零初始化分配，按有界分片并行读取；设备读取复用 CUDA 的文件读取组件，合并连续文件范围并预取到可复用缓冲，再沿现有 stream 上传。原生调用和完成事件仍由所属 rank 持有；失败时等待读取线程退出，已提交 DMA 沿用完成事件及故障隔离规则回收。准备后的模型权重使用对齐 arena，至少 2 MiB 的张量保留 2 MiB 大页边界，其余张量按 512 字节对齐；padding 计入显存预算。请求私有状态和动态 KV 继续使用原有独立布局。TP8 加载队列的临时主机缓冲约 1 GiB，另有各 session 的 pinned 预算，全量常驻表单独计费。API READY 等待全部权重、CPU 表、视觉资源和首轮预热完成。
 
 HTTP 与离线入口并行准备 Chat 前端和模型，CUDA 资源始终在 GPU worker 上创建和释放；两者成功并核对声明的前端身份与词表后才就绪。`WORKER READY` 分别记录前端、模型与并行准备总耗时，`API READY` 的 `startup` 包含前端和 HTTP 初始化。`LOAD STAGES` 提供 CUDA 初始化、buffer 分配、权重流水线等待和算子资产准备计时；`kernel_assets_s` 包含在 `module_load_bind_s` 中，权重等待计时包含在 `weight_upload_s` 中；总耗时按外层计时读取。完整进程到首输出的测量见[性能工具](../tools/bench/README.md)。
 
@@ -408,7 +326,6 @@ HTTP 与离线入口并行准备 Chat 前端和模型，CUDA 资源始终在 GPU
 `run-model MODEL_DIR REQUESTS.json` 接收 token-ID 请求，用于固定块、普通 decode 的诊断基准，逐请求重置状态。输入长度须能由声明的 prefill 计划整除；该入口用于固定长度执行诊断；任意长度、多请求、MTP 和缓存生成通过 Chat API 或 Rust `Model::generate` 验收。
 
 `score-model` 对冻结 token 历史评分，服务的固定场景检查见[API 验证](../tools/api/README.md)，BF16/FP8 质量对照见[质量评测](../tools/eval/README.md)。
-
 
 图片预处理可通过 Chat 请求的 `image_processing` 配置：
 
@@ -425,8 +342,6 @@ HTTP 与离线入口并行准备 Chat 前端和模型，CUDA 资源始终在 GPU
 ```
 
 这些字段均可省略。`max_pixels` 限制每张图缩放后的像素数（至少 65536，尺寸按 patch/merge 对齐）；`max_tokens_per_image` 给每张图固定的视觉 token 预算；`max_tokens` 限制所有图片合计的视觉 token；`max_images` 显式限制图片数量，默认不设置张数上限。总容量同时受模型报告的视觉容量和完整文本上下文限制，主机预处理仍受服务的共享内存预算限制。默认按每张图的实际尺寸处理，超出总容量会返回所需和可用视觉 token 数。
-
-原生 A2 / DSv4.1 的图片历史容量随模型上下文，保留单图最多 1024 个视觉 token 的编码契约；已有执行包中历史性的 8192 总量声明不再限制原生分块覆盖路径。每轮只编码当前 prefill 范围需要的图片，已经命中 KV 前缀的图片跳过编码，消费完的特征从 owner 释放。追加图片保持旧图的处理尺寸和身份；总量超限时即使设置 `auto_resize` 也返回错误，调用方可以显式降低 `max_tokens_per_image` 或 `max_pixels`。Qwen 路径仍支持 `auto_resize: true` 对 `detail: auto` 图片按总预算分配分辨率；长期 agent 历史建议使用固定单图预算。
 
 图片前处理缓存与视觉编码特征缓存、KV prefix cache 分开计费。相同内容和处理几何复用 CPU 解码/缩放结果，并合并同图的并发前处理。HTTP(S) URL 每次读取实际内容以识别原地址的图片变化；data URI 同样按内容识别。需要省去历史图片传输时，先携带完整图片并指定内容项的 `uuid`，随后可以只发送引用：
 

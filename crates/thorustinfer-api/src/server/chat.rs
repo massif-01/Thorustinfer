@@ -166,7 +166,6 @@ pub struct Prepared {
 pub struct ChatCodec {
     pub boundary: Option<super::token_boundary::Boundary>,
     pub tool_format: ToolFormat,
-    pub tools_supported: bool,
     pub audio: Option<thorustinfer_engine::audio::AudioSpec>,
     pub tokenizer: Tokenizer,
     pub asset_hashes: std::collections::BTreeMap<String, String>,
@@ -285,8 +284,6 @@ impl ChatCodec {
         Ok(Self {
             boundary,
             tool_format,
-            tools_supported: tool_format == ToolFormat::DeepSeekV41
-                || descriptor["metadata"]["target"] != "ascend910b",
             audio,
             defaults,
             tokenizer,

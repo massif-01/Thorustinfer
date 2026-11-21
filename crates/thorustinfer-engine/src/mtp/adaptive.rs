@@ -23,13 +23,6 @@ impl Default for Acceptance {
     }
 }
 impl Acceptance {
-    /// Reuse learned conditional priors without inventing request observations.
-    pub(crate) fn prior(&self) -> Self {
-        Self {
-            probability: std::array::from_fn(|i| self.rate(i, 0.7)),
-            samples: [0; MAX_MTP_DRAFTS],
-        }
-    }
     pub(crate) fn observe(&mut self, proposed: usize, accepted: usize) {
         self.observe_batch(&[(proposed, accepted)]);
     }
@@ -204,7 +197,6 @@ pub(crate) struct Selection {
 pub(crate) struct Decision {
     pub id: usize,
     pub exploring: bool,
-    pub calibrating: bool,
 }
 /// Pure scoring. A decision neither earns credit nor spends the startup pool.
 pub(crate) fn select(input: Selection, candidates: &[Candidate]) -> Option<Decision> {
@@ -309,7 +301,6 @@ pub(crate) fn select(input: Selection, candidates: &[Candidate]) -> Option<Decis
                     Decision {
                         id: c.id,
                         exploring: true,
-                        calibrating: missing > 0,
                     },
                     rank,
                 ));
@@ -320,7 +311,6 @@ pub(crate) fn select(input: Selection, candidates: &[Candidate]) -> Option<Decis
         (best.0 != usize::MAX).then_some(Decision {
             id: best.0,
             exploring: false,
-            calibrating: false,
         })
     })
 }
@@ -339,11 +329,6 @@ mod tests {
         let mut c = Acceptance::default();
         c.observe_batch(&[(5, 5), (5, 0)]);
         assert_eq!(b.probability, c.probability);
-        let prior = a.prior();
-        assert_eq!(prior.sample_counts(), &[0; MAX_MTP_DRAFTS]);
-        let mut fresh = prior;
-        fresh.observe(5, 5);
-        assert!(fresh.rate(0, 0.7) > a.rate(0, 0.7));
     }
     #[test]
     fn parallel_capacity_does_not_inflate_an_adopted_prefix_review() {

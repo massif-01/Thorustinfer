@@ -7,8 +7,8 @@
 在设备上解压运行包，运行安装脚本。默认安装目录为 `$HOME/.local/opt/thorustinfer`。安装和运行引擎都不需要 Python，也不用创建 conda 环境。
 
 ```bash
-tar -xJf thorustinfer-0.2.0-linux-aarch64.tar.xz
-bash thorustinfer-0.2.0-linux-aarch64/install.sh
+tar -xJf thorustinfer-0.2.1-linux-aarch64.tar.xz
+bash thorustinfer-0.2.1-linux-aarch64/install.sh
 CLI="$HOME/.local/opt/thorustinfer/bin/thorustinfer"
 "$CLI" --version
 "$CLI" info
@@ -112,4 +112,4 @@ Qwen3.5-4B 在 T5000 上测过 E8P 和 NVFP4 W4A4 两档。要在两档之间选
 
 ## 从源码构建
 
-如需自行编译，请从同一交付位置取得 `thorustinfer-0.2.0-source.tar.xz`，按其中单列的 `BUILD.md` 准备 Rust、Python 和 CUDA 开发工具。用运行包内的 `licenses/CORRESPONDING-SOURCE.sha256` 核对源码归档。
+如需自行编译，请从同一交付位置取得 `thorustinfer-0.2.1-source.tar.xz`，按其中单列的 `BUILD.md` 准备 Rust、Python 和 CUDA 开发工具。用运行包内的 `licenses/CORRESPONDING-SOURCE.sha256` 核对源码归档。

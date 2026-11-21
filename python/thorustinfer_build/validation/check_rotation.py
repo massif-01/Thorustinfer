@@ -1,5 +1,6 @@
 """Verify row-generic expert rotation, dispatch and exact A8 plane fusion."""
 
+from thorustinfer_build.compiler.cuda import target as cuda_target
 import argparse
 from pathlib import Path
 
@@ -20,7 +21,7 @@ def compile_dynamic(fn):
             explicit_rows(fn),
             out_idx=[],
             execution_backend="nvrtc",
-            target={"kind": "cuda", "arch": "sm_87"},
+            **cuda_target.options(),
         )
     )
 

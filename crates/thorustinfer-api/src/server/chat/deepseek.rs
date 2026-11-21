@@ -239,7 +239,7 @@ mod tests {
         env.add_template(
             "chat",
             include_str!(
-                "../../../../../python/thorustinfer_build/models/deepseek_v41/templates/chat.jinja"
+                "../../../../../reference/deepseek-v41/python/thorustinfer_build/models/deepseek_v41/templates/chat.jinja"
             ),
         )
         .unwrap();

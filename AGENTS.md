@@ -4,16 +4,14 @@
 
 ## 范围
 
-- 推理基线为 Jetson AGX Orin 64GB，aarch64/CUDA SM87；共享运行时同时支持 Altus A2 / Ascend 910B 的原生资源、异步传输、W4A8 grouped matmul、ACL Graph 和 HCCL 集合通信验收，DSv4.1 原始 W4A8 完整 40 层通过实验性原生 provider 接入公共请求接口、HTTP/SSE、连续调度及 prefix cache，保留原生 bench 入口。CUDA 数值、Graph 和性能验收仍在 Orin 上执行。
+- 当前主线面向 Jetson Thor（aarch64/CUDA SM110a），T5000 用于实机验收。DeepSeek 原有模型源码和参考保存在 reference/deepseek-v41，历史 A2 设备实现独立归档。
 - 支持 Qwen3.8-27B、Qwen3.5-4B（Qwen3_5）、Qwen3.8-Flash-Next（qwen4_exp）和 Index-Translate-2B/9B/35B（Qwen3_5）的文本、图片和多图输入。
 - Qwen3-ASR-1.7B 使用 Qwen3 全注意力解码器、标准 RMSNorm、128 维全 RoPE 和无输出 gate；复用 Qwen 动态行执行流程。文本采用两级 E8P Q4A8，前 4 层 Q/K/V 与 FFN 保留同一 signed-block128 输入基下的 W8，attention 输出投影保留 W8；音频编码器和 projector 保留 FP16，KV 使用 group-64 INT8。Rust 负责音频解码、16 kHz 重采样和 128-bin log-mel，TileLang 执行有界 CNN 与 104-token 窗口编码器。音频特征、位置和输入身份属于请求私有状态及 prefix 缓存身份。
 - ASR 的 Q/K/V 与 gate/up 通过无损拼接权重输出行共享整数投影模板。音频 CNN 使用 NHWC；前处理按帧组并行，多个录音按 104-token 窗口边界打包编码，再写回各 owner 的特征。逐窗口有效长度保持录音边界；GPU 验收覆盖改变输入、反向准入、空闲 arena 复用、prefix 恢复及完整请求。
 - ASR 文件前处理复用 Symphonia、Rubato 固定比例 FFT 重采样和启用 NEON 的 RealFFT；checkpoint 专用窗函数、mel 滤波与归一化保持参考语义。重采样改动检查时长、时间对齐、通带和抗混叠，并以真实录音及固定历史概率验收。
 - ASR 按本轮选中的文本 packet 准备录音，音频编码单独计入启动成本；特征通过 owner 地址写回，保留统一 stream 顺序和范围校验。吞吐策略的冷请求准入以模型 prefill packet 容量为预算。空闲 arena 选择在连续内存估算与租用之间复用，租用、释放、重置和回收使选择缓存失效。
 - Qwen 公共动态行执行器将普通 decode 的 token 输入、prepare、embedding、媒体覆盖、位置推进、MTP hidden 捕获、最终 norm 和输出分发作为地址表 packet 执行；混合普通 packet 中的 decode 前缀复用同一边界。离线通过 independent_rows 包装原始一行算术，层状态表后追加固定顺序的边界列，Rust 与 Python 共享列序契约并验证反向 owner、batch 变化、取消复用与 MTP 衔接。完整 logits 与选中 token 保留各请求的输出语义。
-- 在线运行时用 Rust，生产 GPU kernel 以 TileLang 为源；Python 只用于离线转换、编译、参考和验证。A2 已有 ACLNN W4A8 grouped matmul 保留为接通模型的基线；新增 A2 算子用 TileLang-Ascend 离线编译，由 Rust 的指针表 C ABI 加载。AOT 库内描述必须与外部 dtype、shape、访问方式和编译身份一致，Graph 和完成事件持有全部原生资源。
-- DSv4.1 A2 的 W4 bank、scale 和 assist 在离线阶段准备并落盘；在线直接读取物理布局，按计划校验形状和字节范围，不执行 W4 转置、全量参考对照或权重 payload 哈希扫描。
-- DSv4.1 A2 多请求共享权重和聚合 token 行，KV、C2 环及解码 KV workspace 按 owner 隔离，私有状态复用公共对齐 arena 布局。Graph 准备关闭私有状态写入，缓存按实际显存预留回收；捕获前统一探测各 rank 缓存，任一 rank 未命中时全体失效同一形状并捕获，保持 HCCL 序列一致。普通推理使用默认高性能通信；`HCCL_DETERMINISTIC=strict` 作为显式复现选项。请求隔离和固定历史概率误差独立验收，不要求默认通信下跨 batch 逐位相同。TP8 为当前接通模型的方案，后续按实际显存、通信和完整请求性能选择并行策略。原生 batch 包默认 2048 行与每 owner 4096 上下文，准入同时校验 owner 数及显存预算。
+- 在线运行时用 Rust，生产 GPU kernel 以 TileLang 为源；Python 只用于离线转换、编译、参考和验证。
 - 模型实现、公共执行组件、TileLang kernel 和离线构建工具在统一 workspace 维护。CUDA 模型适配器随 `thorustinfer-models` 静态链接进 `thorustinfer-engine`，通过 Rust 类型组装执行程序、动态 batch 和状态绑定。CUDA schema 2 执行包发布 `package.json`、`bindings.json` 与包含 TileLang cubin 的 `assets.safetensors`。公共执行器从模型契约读取模型族、层数、维度和层序，新增架构通过适配器注册接入。
 - 第一阶段包含 prefix cache 与多请求 batching；缓存恢复和 batch 调度必须保持完整 KV/GDN/卷积/MTP 状态及请求隔离。
 - 项目许可证为 LGPL-3.0-or-later，保留第三方版权和许可证声明。
@@ -34,7 +32,7 @@
 - Flash Next 采用已确定的混合量化方案：专家保留整数 E8P Q2A8；主干 GDN QKV/Z、QSA Q/gate 和 target/MTP 共享输出头采用 signed-block128 旋转、输出行 scale 的 Q4A8。GDN/QSA 输出投影、共享 FFN 和 MTP 草稿 Q/O 保留 W8；其余精度敏感部分维持原混合精度。原生适配器统一校验和执行该策略。
 - Flash Next 使用我们自己的整数 E8P＋旋转量化表示，运行时从自有编码反量化到 INT8 计算。当前优先完成算子和真实端到端推理，允许免校准或小样本校准；原始 BF16 按矩阵或专家分块读取，分块释放。完整校准需单独验证专家覆盖和层间误差；BF16 基线必须直接来自原始浮点权重。
 - E8P 可使用无损 K64/K128 压缩权重重排及完整 A8 位平面分解，以两个 INT4 Tensor Core 乘积恢复原 INT32 点积；此过程保持完整 A8 精度，必须保留原 scale 与 FP16 边界，并验证非零码本前提。MTP、并发及大 prefill 配置通过验证后启用该路径，其余配置保留 INT8 路径，读取同一份压缩 bank。
-- 在线模型采用 HF 配置/tokenizer 目录和 schema 1 的 `cache/model.json` 数据描述。模型数据通过 `execution_package` digest 固定独立包，CUDA 使用 schema 2，DSv4.1 A2 使用 schema 1 原生计划封装。标准分片 safetensors 保留当前 W4 表示。CUDA 在线校验配置签名、kernel ABI、tensor dtype、shape、物理 layout 与容器边界，默认跳过内容哈希。CUDA 的 `--verify-weights` 启用显式加载校验，`validate-model` 完整校验前端、CPU 资产、执行包及权重。离线 AOT manifest 与算子夹具使用各自契约。
+- 在线模型采用 HF 配置/tokenizer 目录和 schema 1 的 `cache/model.json` 数据描述。模型数据通过 `execution_package` digest 固定独立包，CUDA 使用 schema 2。标准分片 safetensors 保留当前 W4 表示。CUDA 在线校验配置签名、kernel ABI、tensor dtype、shape、物理 layout 与容器边界，默认跳过内容哈希。CUDA 的 `--verify-weights` 启用显式加载校验，`validate-model` 完整校验前端、CPU 资产、执行包及权重。离线 AOT manifest 与算子夹具使用各自契约。
 - 服务协议位于 thorustinfer-api；CLI 只处理命令。CUDA 执行器、加载器、模型适配器、计算策略与生成/视觉/MTP 控制分离；权重、序列状态和 workspace 分作用域管理。
 - HTTP 与离线入口并行准备前端和模型；CUDA 模型在所属 worker 创建、使用及销毁，前端失败或 panic 也需等待并正确回收，模型销毁完成后再释放 GPU 锁。只读权重 arena 保持每张量对齐且仅释放单一 owner，padding 计入权重与显存预算；请求状态、KV 和按需专家单独管理。权重读取和 DMA 有界流水化，缓冲区复用及失败清理等待对应传输完成；启动验收同时测进程到 API 就绪、首输出及首请求完成。
 - JSONL 离线入口与 HTTP 复用 Chat 前端、模型加载和连续 worker 及状态提交流程；输入有界预处理、完成即写结果，续跑固定输入和模型/参数身份，截断与错误分别统计。
@@ -52,7 +50,6 @@
 - Flash Next 最终包通过原生 build.py 和共享 row_selection.py 离线调优，按测量结果生成局部选择表，只发布被选择的实现。混合因果段及 MTP warm 支持连续 1–512 行；剩余长度与延迟预算决定实际片段。MixedRows 在现有 ABI v1 flags 中显式携带前置 prefill 片段数，以该字段识别 prefill/验证角色；缓存身份包含该角色边界。warm 用一个 min_tokens=1 的容量模板，MtpLength 必须在映射动态 KV 前更新。最终执行包重打包资产，移除未引用的候选及旧 cubin。共享大行数计算通过 row_tuning.py 与 row_convergence.py 按测量结果发布；专家路由与上下投影共同选择。HC injection 的直接与矩阵 tile 统一 BF16 MMA K16 累加顺序，单行参考也保持相同契约；候选必须保持相同的 MMA K16 累加与舍入契约。动态绑定合并只改身份，保留原始 grid、实参表达式和 token 到专家行倍率。动态 MTP 在映射 KV 之前写入真实验证长度。视觉使用一个动态 patch 模板，merger launch 按实际 patch 数除以 4；提高视觉容量时须保持现有文本程序的行数契约。MTP 验证、恢复、捕获各用一个容量 8、min_tokens=2 的入口，运行时传递真实长度，固定形状参考包仅作离线构建输入。
 - 跨 block 同步使用显式声明的 cooperative launch，并校验 occupancy。
 - 性能验收使用真实模型的完整请求 TPS。合成探针、算子微测和四输出 profile 用于定位局部成本。
-- DSv4.1 A2 的最终性能目标以 Mini-Weka agent 端到端回放衡量，先接通 thorustinfer 的 HTTP、长上下文和完整 prefix 状态。只运行用户授权的短测，调优阶段不执行一小时回放；保留固定输入／输出长度、同源主 agent 片段和每轮瓶颈证据，参考 vLLM-Ascend、SGLang 与 DeepInfer 后实现优化、验证、提交并推送。
 - 质量对照官方 BF16 或同模型 FP8，固定 seed20261002 及 teacher-forced 历史；质量结合任务结果、target NLL、token 概率和长上下文行为判断，token 一致率作为诊断指标。
 
 ## 开发
@@ -64,7 +61,7 @@
 - 先用 rg 检查调用者和依赖；保持修改小而完整。subagent 仅在用户或适用指令明确要求时启动。
 - 每轮性能优化采用分阶段检查：候选阶段只做相关算子数值和 Graph 验证、2K/2049、一个代表性 batch 及固定历史 decode 短测；契约未变时复用已通过的验证。确认收益后运行一次 240 秒 Mini，与冻结基线比较；仅在波动或疑似超过 10% 回退时补充配对复测。提交前统一运行一次 `make check`；状态、prefix 和隔离检查限定于实际改动的契约，架构首次验收完成后不随每个 tile 候选重复。禁止过度检查拖慢迭代，不因外部 CPU 活动阻塞测试。
 - 模型 packet 通过公共 Rows、视图及地址表绑定组件计算行布局；模型声明 owner 角色候选、计算顺序与状态边界。普通、混合、验证和 draft 复用这些组件。
-- 离线编译复用 `python/thorustinfer_build/compiler`，调优复用 `python/thorustinfer_build/tuning`；文件身份、原子元数据、路径和共享 GPU 锁位于 `python/thorustinfer_build/common`。生产 kernel 位于 `kernels/cuda`、`kernels/ascend` 与 `kernels/shared`，设备验证程序位于 `tests`。共享组件源码计入消费者缓存身份。
+- 离线编译复用 `python/thorustinfer_build/compiler`，调优复用 `python/thorustinfer_build/tuning`；文件身份、原子元数据、路径和共享 GPU 锁位于 `python/thorustinfer_build/common`。生产 kernel 位于 `kernels/cuda` 与 `kernels/shared`，设备验证程序位于 `tests`。共享组件源码计入消费者缓存身份。
 - CPU Python 依赖由根目录 `pyproject.toml`/`uv.lock` 管理，CUDA 离线依赖由 `tools/environments/cuda` 中的独立 uv 项目管理；分别用 `make python-env` 和 `make cuda-env` 同步，工具通过 `uv run --locked` 执行。`make check` 执行 Rust 格式/编译/clippy/测试及 CPU 评测检查；CUDA GPU 验证用 `bash tools/environments/cuda/run.sh`，直接使用当前物理机的 CUDA 工具链和独立 uv 环境。
 - 开发 worktree 位于仓库外；通过 `tools.dev.workspace` 初始化独立构建目录及共享缓存、记录、发布目录。GPU 工作使用 common.paths 解析的共享锁，原 `artifacts/gpu-experiment.lock` 链接保留同一锁 inode；保留其他服务，并保持全局频率、功耗和缓存设置。
 - GPU 单测使用本轮构建输出的测试可执行文件，核对测试确实执行，并从本轮构建结果解析实际可执行文件路径。

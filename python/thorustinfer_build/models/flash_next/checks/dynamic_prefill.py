@@ -5,6 +5,7 @@ multiple non-aligned lengths. This is execution equivalence, not quantization
 quality or a substitute for the Rust model's end-to-end performance gate.
 """
 
+from thorustinfer_build.compiler.cuda import target as cuda_target
 import argparse
 from pathlib import Path
 
@@ -152,8 +153,7 @@ def main():
             function,
             out_idx=[],
             execution_backend="nvrtc",
-            target={"kind": "cuda", "arch": "sm_87"},
-            pass_configs=(
+            **cuda_target.options(
                 {"tl.disable_thread_storage_sync": True, "tl.disable_shared_memory_reuse": True}
                 if label == "gdn-prefetch"
                 else {}

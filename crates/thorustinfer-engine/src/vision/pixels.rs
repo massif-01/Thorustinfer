@@ -1,4 +1,4 @@
-//! Exact checkpoint pixel packing shared by CUDA and Ascend frontends.
+//! Exact checkpoint pixel packing for model image frontends.
 use super::{ImageInput, ImageLayout, Precision, VisionSpec};
 use crate::artifact::Result;
 use std::sync::OnceLock;

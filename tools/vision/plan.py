@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import torch
 from safetensors import safe_open
+from thorustinfer_build.compiler.cuda import target
 from thorustinfer_build.compiler.cuda.common import export_kernel
 from thorustinfer_build.contracts.abi import parse_host, evaluate
 from kernels.cuda.vision import encoder
@@ -30,8 +31,8 @@ class EncoderBuilder:
             includes = Path(tilelang.__file__).parent
             subprocess.run(
                 [
-                    "/usr/local/cuda/bin/nvcc",
-                    "-arch=sm_87",
+                    "nvcc",
+                    f"-arch={target.architecture()}",
                     "-std=c++17",
                     "--cubin",
                     f"-I{includes}/src",

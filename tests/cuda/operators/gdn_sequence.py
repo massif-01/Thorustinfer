@@ -1,5 +1,6 @@
 """Validate FP32 GDN state across chunks, verification and accepted prefixes."""
 
+from thorustinfer_build.compiler.cuda import target as cuda_target
 import argparse
 from pathlib import Path
 
@@ -69,11 +70,12 @@ def main():
         ),
         out_idx=[],
         execution_backend="nvrtc",
-        target={"kind": "cuda", "arch": "sm_87"},
-        pass_configs={
-            "tl.disable_thread_storage_sync": True,
-            "tl.disable_shared_memory_reuse": True,
-        },
+        **cuda_target.options(
+            {
+                "tl.disable_thread_storage_sync": True,
+                "tl.disable_shared_memory_reuse": True,
+            }
+        ),
     )
     state.copy_(initial)
     prefill.adapter.func(

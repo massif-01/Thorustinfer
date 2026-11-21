@@ -27,7 +27,7 @@ def source_modules(root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=["cuda", "ascend"], default="cuda")
+    parser.add_argument("--backend", choices=["cuda"], default="cuda")
     args = parser.parse_args()
     root = ROOT
     modules = source_modules(root)
@@ -35,16 +35,6 @@ def main():
     imported = 0
     for path in modules:
         relative = path.relative_to(root)
-        other = "ascend" if args.backend == "cuda" else "cuda"
-        if other in relative.parts:
-            continue
-        if args.backend == "cuda" and "deepseek_v41" in relative.parts:
-            continue
-        if args.backend == "ascend" and any(
-            p in relative.parts
-            for p in ["flash_next", "qwen35", "qwen_asr", "nemotron_embed", "qwen_reranker"]
-        ):
-            continue
         if relative.parts[0] == "python":
             relative = relative.relative_to("python")
         name = ".".join(relative.with_suffix("").parts)

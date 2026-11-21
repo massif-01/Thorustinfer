@@ -1,5 +1,6 @@
 """Verify fused routing/planes against dispatch followed by exact A8 packing."""
 
+from thorustinfer_build.compiler.cuda import target as cuda_target
 import argparse
 from pathlib import Path
 
@@ -26,7 +27,7 @@ def main():
         explicit_rows(dispatch_prefill_a8.__wrapped__(4096, dynamic_rows=True)),
         out_idx=[],
         execution_backend="nvrtc",
-        target={"kind": "cuda", "arch": "sm_87"},
+        **cuda_target.options(),
     )
     export_kernel(candidate, args.output / "aot")
     report = dict(complete=False, cases=[])

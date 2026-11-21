@@ -166,7 +166,7 @@ impl Executor {
         let allocation = Rc::new(Allocation {
             id: crate::backend::kv::allocation_id()?,
             used: bytes,
-            native: None,
+
             owner: self.session.owner,
             address,
             bytes,
@@ -562,7 +562,6 @@ impl Executor {
                     bytes: self.sizes[name],
                     used: self.sizes[name],
                     handle: None,
-                    native: None,
                 }),
             })
             .collect::<Vec<_>>();
@@ -633,7 +632,6 @@ mod tests {
             bytes: 8192,
             used: 100,
             handle: Some(7),
-            native: None,
         });
         let mut piece = Piece {
             allocation,
