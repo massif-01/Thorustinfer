@@ -122,9 +122,9 @@ DSv4.1 使用本模型的 effort 编码：开启 thinking 后默认 `high=75`，
 
 DSv4.1 编码区分 checkpoint 模板产生的控制标记和正文。用户、工具结果、历史工具参数及工具 schema 中同名的特殊标记按普通文字编码。流式输出与 thinking 硬预算以实际控制 token ID 识别边界，普通 token 拼出的 `</think>` 或 DSML 标签保留为文字。图片占位继续由媒体前端生成并校验。
 
-### Estuary 网关
+### 内置协议与可选 Estuary 网关
 
-Responses 和 Messages 由 [Estuary](https://github.com/iMMIQ/estuary) 转换为 `/v1/chat/completions`。thorustinfer 提供 `POST /v1/chat/completions/render`，接受相同 Chat 请求、鉴权与部署默认参数，返回 `model`、最终 `token_ids`、`token_count` 和 `multimodal`。渲染选项 `return_mm_kwargs` 支持省略或 `false`，返回范围为 token 和计数，不序列化媒体张量。它复用实际请求的模板、编码、图片前处理和占位展开，供网关计数；请求受前处理并发、内存及 body 预算限制，不占用生成队列槽位或 NPU owner，也不执行视觉编码器或模型推理。多模型管理入口同时转发此路径，渲染不预留生成状态内存。
+单模型和管理服务均内置 `/v1/responses`、`/v1/messages` 和 `/v1/messages/count_tokens`。客户端配置和支持范围见[运行包指南](../tools/thor/README.md#连接-codex-和-claude-code)。已有 [Estuary](https://github.com/iMMIQ/estuary) 网关的部署也可以继续使用 Chat 上游。thorustinfer 提供 `POST /v1/chat/completions/render`，接受相同 Chat 请求、鉴权与部署默认参数，返回 `model`、最终 `token_ids`、`token_count` 和 `multimodal`。渲染选项 `return_mm_kwargs` 支持省略或 `false`，返回范围为 token 和计数，不序列化媒体张量。它复用实际请求的模板、编码、图片前处理和占位展开，供网关计数；请求受前处理并发、内存及 body 预算限制，不占用生成队列槽位或 NPU owner，也不执行视觉编码器或模型推理。多模型管理入口同时转发此路径，渲染不预留生成状态内存。
 
 Estuary 节点选用 `openai` provider，上游填写 thorustinfer 的 `/v1` 地址。该模式沿用网关的通用负载和近似前缀路由；thorustinfer 的 `/metrics` 使用自身指标名，真实缓存事件与 vLLM 专用路由协议另行对接。多模态 token ID 不构成图片缓存身份。
 

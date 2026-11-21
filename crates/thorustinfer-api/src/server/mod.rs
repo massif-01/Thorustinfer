@@ -17,6 +17,7 @@ mod render_test;
 pub(crate) mod startup;
 mod thinking;
 mod token_boundary;
+pub(crate) mod wire;
 
 use axum::{
     Json, Router,
@@ -120,9 +121,10 @@ pub fn run(settings: Settings) -> Result<()> {
     runtime.shutdown_timeout(std::time::Duration::from_secs(2));
     result
 }
-fn router(state: Service) -> Router {
+fn router(state: Service, worker: bool) -> Router {
     let limits = state.limits;
     Router::new()
+        .merge(wire::routes(&state, worker))
         .route("/health", get(health))
         .route("/metrics", get(metrics::endpoint))
         .route("/v1/models", get(models))
@@ -170,7 +172,7 @@ async fn serve(settings: Settings) -> Result<()> {
     let context = state.context;
     let scheduler = state.scheduler;
     let limits = state.limits;
-    let router = router(state);
+    let router = router(state, settings.listen.starts_with("unix:"));
     eprintln!(
         "API READY http://{}/v1; context {context}; continuous_batching=true, max_active={}, queue 128; startup={:.3}s",
         settings.listen,
@@ -342,21 +344,23 @@ async fn completions(
     axum::Extension(admission): axum::Extension<preparation::Ingress>,
     body: std::result::Result<Json<Value>, JsonRejection>,
 ) -> Response {
-    prepare_chat(state, admission, body, false).await
+    prepare_chat(state, admission, body, false, None).await
 }
 async fn render(
     State(state): State<Service>,
     axum::Extension(admission): axum::Extension<preparation::Ingress>,
     body: std::result::Result<Json<Value>, JsonRejection>,
 ) -> Response {
-    prepare_chat(state, admission, body, true).await
+    prepare_chat(state, admission, body, true, None).await
 }
 async fn prepare_chat(
     state: Service,
     admission: preparation::Ingress,
     body: std::result::Result<Json<Value>, JsonRejection>,
     render: bool,
+    wire: Option<wire::Wire>,
 ) -> Response {
+    let counting = wire.as_ref().is_some_and(|w| w.kind == wire::Kind::Count);
     let request = match body {
         Ok(Json(mut v)) => {
             if render {
@@ -392,7 +396,11 @@ async fn prepare_chat(
         state.context,
         state.vision.as_ref(),
         state.limits.memory_mib,
-        state.codec.max_tokens(&request),
+        if counting {
+            0
+        } else {
+            state.codec.max_tokens(&request)
+        },
     );
     let memory_mib = estimate.mib;
     if memory_mib as usize > state.limits.memory_mib {
@@ -427,6 +435,7 @@ async fn prepare_chat(
     let context = state.context;
     let vision = state.vision.clone();
     let image_cache = Arc::clone(&state.preparation.images);
+    let ordered_assistant_parts = wire.is_some();
     let cancellation = preparation::Cancellation::default();
     let flag = cancellation.flag();
     let pool = Arc::clone(&state.preparation);
@@ -436,6 +445,8 @@ async fn prepare_chat(
         let _body = body;
         let mut preparation = estimate.context(flag);
         preparation.images = Some(image_cache);
+        preparation.count_only = counting;
+        preparation.ordered_assistant_parts = ordered_assistant_parts;
         preparation.timing = timing;
         let started = Instant::now();
         let result = (|| -> Result<_> {
@@ -465,10 +476,17 @@ async fn prepare_chat(
         Ok(Err(e)) => return error(StatusCode::BAD_REQUEST, e),
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    let (prepared, slot, memory, timing) = prepared;
+    let (mut prepared, slot, memory, timing) = prepared;
+    prepared.native_events = wire.is_some() && !counting;
     let memory = Arc::new(memory);
     if !state.activity.lifecycle.is_ready() {
         return error(StatusCode::SERVICE_UNAVAILABLE, "GPU worker is not ready");
+    }
+    if counting {
+        return retain_output_memory(
+            Json(json!({"input_tokens":prepared.input.len()})).into_response(),
+            memory,
+        );
     }
     if render {
         return retain_output_memory(Json(json!({"model":state.model.as_ref(),"token_ids":prepared.input,"token_count":prepared.input.len(),"multimodal":!prepared.images.is_empty() || !prepared.audios.is_empty()})).into_response(), memory);
@@ -503,6 +521,10 @@ async fn prepare_chat(
         job.id,
         serde_json::to_string(&timing).unwrap()
     );
+    let native = wire.map(|mut w| {
+        w.parallel = job.prepared.parallel;
+        (w, job.id.clone(), job.prepared.input.len())
+    });
     if let Err(e) = state.jobs.try_send(job) {
         return match e {
             mpsc::error::TrySendError::Full(_) => {
@@ -510,6 +532,12 @@ async fn prepare_chat(
             }
             _ => error(StatusCode::SERVICE_UNAVAILABLE, "GPU worker unavailable"),
         };
+    }
+    if let Some((wire, id, prompt)) = native {
+        return retain_output_memory(
+            wire::deliver(wire, id, created, prompt, responses).await,
+            memory,
+        );
     }
     if stream {
         let events =

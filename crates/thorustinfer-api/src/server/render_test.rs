@@ -34,7 +34,7 @@ async fn render_uses_real_preparation_with_auth_and_without_generation_capacity(
         "http://{}/v1/chat/completions/render",
         listener.local_addr().unwrap()
     );
-    let router = router(state.clone());
+    let router = router(state.clone(), false);
     let task = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
@@ -123,6 +123,20 @@ async fn render_uses_real_preparation_with_auth_and_without_generation_capacity(
             .status(),
         StatusCode::BAD_REQUEST
     );
+    // Counting uses the same template with the generation queue completely full.
+    // The client-supplied output reservation exceeds the model's whole context.
+    let count=client.post(url.replace("/v1/chat/completions/render","/v1/messages/count_tokens"))
+        .header("anthropic-version","2023-06-01").header("x-api-key","render-test")
+        .json(&json!({"model":"test","messages":[{"role":"user","content":"count me"}],"max_tokens":99999999}))
+        .send().await.unwrap();
+    assert_eq!(count.status(), StatusCode::OK);
+    let value: Value = count.json().await.unwrap();
+    assert!(value["input_tokens"].as_u64().unwrap() > 0);
+    assert_eq!(state.slots.available_permits(), 0);
+    assert!(matches!(
+        received.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
     state.activity.lifecycle.drain();
     assert_eq!(
         client

@@ -2,7 +2,7 @@
 
 ## Upstream Orinfer
 
-thorustinfer 0.1.0 is derived from [iMMIQ/orinfer](https://github.com/iMMIQ/orinfer).
+thorustinfer 0.2.0 is derived from [iMMIQ/orinfer](https://github.com/iMMIQ/orinfer).
 The upstream baseline is commit
 [`b5ce33d5c04d244b292c5f7866d79b2e0cb1165d`](https://github.com/iMMIQ/orinfer/commit/b5ce33d5c04d244b292c5f7866d79b2e0cb1165d).
 The Orinfer-derived engine and its modifications are licensed under
@@ -22,15 +22,17 @@ retain their own copyright notices and licenses.
   ABIs. Added the upstream attribution and corresponding-source instructions
   to the distribution on the same date.
 
+- **2026-11-21:** Added native Responses and Messages HTTP endpoints, token counting and client-side tool replay in the 0.2.0 release.
+
 ## Corresponding source for the distributed runtime
 
-Distribute `thorustinfer-0.1.0-source.tar.xz` together with
-`thorustinfer-0.1.0-linux-aarch64.tar.xz`, in the same delivery directory,
+Distribute `thorustinfer-0.2.0-source.tar.xz` together with
+`thorustinfer-0.2.0-linux-aarch64.tar.xz`, in the same delivery directory,
 download location or on the same medium. The source archive contains the
 modified project, vendored build dependencies, CUTLASS headers and build
 instructions in `BUILD.md`.
 
-If you received only the runtime, obtain **`thorustinfer-0.1.0-source.tar.xz`
+If you received only the runtime, obtain **`thorustinfer-0.2.0-source.tar.xz`
 from the person or organization that supplied that runtime**, or from the same
 delivery location. Give the supplier the exact SHA-256 recorded in your
 runtime's `licenses/CORRESPONDING-SOURCE.sha256`. To verify the archive,

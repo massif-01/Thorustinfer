@@ -12,11 +12,11 @@ export CUTLASS_ROOT="$PWD/cutlass"
 export PATH="$(dirname "$(rustup which rustc)"):$CUDA_HOME/bin:$PATH"
 # 若使用上述解包的系统 C++ 库
 export CXXFLAGS="-B$HOME/build-support/jammy/usr/lib/gcc/aarch64-linux-gnu/11"
-SOURCE_ARCHIVE="$(dirname "$PWD")/thorustinfer-0.1.0-source.tar.xz"
+SOURCE_ARCHIVE="$(dirname "$PWD")/thorustinfer-0.2.0-source.tar.xz"
 cd source
-bash tools/thor/build.sh "$HOME/thorustinfer-build-0.1.0" "$SOURCE_ARCHIVE"
+bash tools/thor/build.sh "$HOME/thorustinfer-build-0.2.0" "$SOURCE_ARCHIVE"
 ```
 
-归档名为 thorustinfer-0.1.0-linux-aarch64.tar.xz。构建器使用锁定的 Cargo 源离线编译，编译引擎自带 NVFP4 库，随后生成安装器、依赖许可证及文件校验和。输出目录内 runtime.sha256 可用于校验归档。从普通 Git checkout 构建时先准备 Cargo.lock 所列依赖或配置 vendor，并将 CUTLASS_ROOT 指向上述头文件。开发检查使用 make check，CPU Python 环境由 uv.lock 管理。
+归档名为 thorustinfer-0.2.0-linux-aarch64.tar.xz。构建器使用锁定的 Cargo 源离线编译，编译引擎自带 NVFP4 库，随后生成安装器、依赖许可证及文件校验和。输出目录内 runtime.sha256 可用于校验归档。从普通 Git checkout 构建时先准备 Cargo.lock 所列依赖或配置 vendor，并将 CUTLASS_ROOT 指向上述头文件。开发检查使用 make check，CPU Python 环境由 uv.lock 管理。
 
 分发时将精确对应的源码归档和运行归档放在一起。构建命令的第二个参数是解包所用的源码归档；脚本把它的 SHA-256 写入运行包内的 licenses/CORRESPONDING-SOURCE.sha256。仅在本地从 Git checkout 开发时，可省略该归档参数。

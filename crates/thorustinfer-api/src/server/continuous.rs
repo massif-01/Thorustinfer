@@ -208,6 +208,7 @@ impl<'a> Response<'a> {
             job.prepared.stops.clone(),
             &job.id,
         );
+        parser.native_events = job.prepared.native_events;
         parser.tool_format(job.prepared.tool_format);
         parser.structured_json(job.prepared.structured);
         parser.constrained_tools(job.prepared.constrained_tools);
@@ -389,9 +390,9 @@ impl<'a> Response<'a> {
             .top_logprobs
             .map(|_| json!({"content":self.content_scores,"refusal":null}));
         let response = if job.prepared.stream {
-            // SSE has already delivered content and scores. Complete is only
-            // its terminal signal; do not retain a second full response.
-            json!({})
+            // The Chat SSE path uses only the terminal signal. Other encoders also
+            // need the actual usage, parser outcome and matched stop sequence.
+            json!({"finish_reason":reason,"usage":usage,"exhausted":exhausted,"incomplete_call":self.parser.incomplete_call,"stop_sequence":self.parser.stop_sequence})
         } else {
             json!({"id":job.id,"object":"chat.completion","created":job.created,"model":model,
                 "choices":[{"index":0,"message":self.parser.message(),"finish_reason":reason,"logprobs":logprobs}],"usage":usage})
@@ -981,6 +982,7 @@ mod tests {
             _memory: None,
             limits: Limits::default(),
             prepared: Prepared {
+                native_events: false,
                 tool_format: output::ToolFormat::Qwen,
                 audios: vec![],
                 input: vec![1],

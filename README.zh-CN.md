@@ -2,7 +2,7 @@
 
 [English](README.md) · [中文](README.zh-CN.md)
 
-Thorustinfer 让你的应用通过 OpenAI Chat Completions API（`POST /v1/chat/completions`）调用 Jetson Thor 上的本地模型。接口支持流式输出；模型支持工具调用时，也可返回工具请求。管理服务可以按需加载模型。在 T5000 上，管理服务空载时占用约 9.45 MiB 常驻内存（RSS，三次启动的中位数）。加载模型后，权重、缓存和计算还会占用内存。
+Thorustinfer 在 Jetson Thor 上运行本地模型。同一个 HTTP 地址提供 Chat Completions、OpenAI Responses 和 Anthropic Messages。客户端可以接收流式回答、在本机执行工具，再将结果交给模型继续回答。管理服务可以按需加载模型。在 T5000 上，管理服务空载时占用约 9.45 MiB 常驻内存（RSS，三次启动的中位数）。加载模型后，权重、缓存和计算还会占用内存。
 
 ## 快速上手
 
@@ -11,8 +11,8 @@ Thorustinfer 让你的应用通过 OpenAI Chat Completions API（`POST /v1/chat/
 在装有兼容 NVIDIA 驱动的 Jetson Thor（Linux aarch64）上解压运行包，执行安装脚本。安装和运行都不需要 Python，也不用创建 conda 环境。`info` 显示引擎信息，`devices` 列出可用的 GPU。
 
 ```bash
-tar -xJf thorustinfer-0.1.0-linux-aarch64.tar.xz
-bash thorustinfer-0.1.0-linux-aarch64/install.sh
+tar -xJf thorustinfer-0.2.0-linux-aarch64.tar.xz
+bash thorustinfer-0.2.0-linux-aarch64/install.sh
 CLI="$HOME/.local/opt/thorustinfer/bin/thorustinfer"
 "$CLI" info
 "$CLI" devices --backend cuda
@@ -39,6 +39,10 @@ curl -fsS http://127.0.0.1:8088/v1/chat/completions \
 ```
 
 返回的 JSON 中，`choices[0].message.content` 就是模型的回答。
+
+## 连接 Agent 客户端
+
+Codex CLI 使用 Responses，把 provider 的 `base_url` 设为 `http://设备地址:8088/v1`，启用 HTTP 流。Claude Code 使用 Messages，把 `ANTHROPIC_BASE_URL` 设为 `http://设备地址:8088`，用 `--model local-model` 选择模型。两种客户端都可以使用管理器中注册的模型别名。完整配置、工具回填和接口范围见[安装指南](tools/thor/README.md#连接-codex-和-claude-code)。
 
 ## 执行方式与性能
 

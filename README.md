@@ -2,7 +2,7 @@
 
 [English](README.md) · [中文](README.zh-CN.md)
 
-Run a local model on Jetson Thor with Thorustinfer. Connect your client using the OpenAI Chat Completions API (`POST /v1/chat/completions`), with support for streaming and model-supported tool calls. The model manager can load models on demand. On a T5000, the idle manager used 9.45 MiB of resident memory (median RSS across three starts). Inference needs additional memory for weights, caches and computation.
+Run a local model on Jetson Thor. A single HTTP address serves OpenAI Chat Completions, OpenAI Responses and Anthropic Messages. Clients can stream text, run tools locally and return their results for the next model turn. The model manager can load models on demand. On a T5000, the idle manager used 9.45 MiB of resident memory (median RSS across three starts). Inference needs additional memory for weights, caches and computation.
 
 ## Get started
 
@@ -11,8 +11,8 @@ Run a local model on Jetson Thor with Thorustinfer. Connect your client using th
 On a Jetson Thor running Linux aarch64 with a compatible NVIDIA driver, unpack the archive and run the installer. You can install and run the engine without Python or a conda environment. Use `info` to inspect the engine and `devices` to list the GPUs it can see.
 
 ```bash
-tar -xJf thorustinfer-0.1.0-linux-aarch64.tar.xz
-bash thorustinfer-0.1.0-linux-aarch64/install.sh
+tar -xJf thorustinfer-0.2.0-linux-aarch64.tar.xz
+bash thorustinfer-0.2.0-linux-aarch64/install.sh
 CLI="$HOME/.local/opt/thorustinfer/bin/thorustinfer"
 "$CLI" info
 "$CLI" devices --backend cuda
@@ -39,6 +39,15 @@ curl -fsS http://127.0.0.1:8088/v1/chat/completions \
 ```
 
 Read the model's answer in the JSON field `choices[0].message.content`.
+
+## Connect an agent
+
+Use the same model name for direct serving or a registered manager alias. Set the server’s `THORUSTINFER_API_KEY` before startup when using authentication, then set `THOR_LOCAL_KEY` to that value on your client.
+
+- **Codex CLI** uses a custom model provider with `base_url = "http://HOST:8088/v1"`, `wire_api = "responses"` and `supports_websockets = false`. Use HTTP streaming and client-supplied history.
+- **Claude Code** uses `ANTHROPIC_BASE_URL=http://HOST:8088` and `ANTHROPIC_API_KEY="$THOR_LOCAL_KEY"`. Select the deployed model with `--model local-model`. Its Messages requests use API version `2023-06-01`.
+
+The installation guide includes copyable configuration, tool replay semantics and the supported API subset. [Agent configuration](tools/thor/README.md#连接-codex-和-claude-code)
 
 ## Execution and performance
 

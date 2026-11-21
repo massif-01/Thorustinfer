@@ -142,6 +142,7 @@ pub struct ChatRequest {
 }
 
 pub struct Prepared {
+    pub native_events: bool,
     pub tool_format: ToolFormat,
     pub input: Vec<u32>,
     pub prefix_hints: Vec<usize>,
@@ -554,7 +555,11 @@ impl ChatCodec {
             &request.image_processing,
             preparation,
         )?;
-        let mut messages = normalize_messages_for(raw_messages, self.tool_format)?;
+        let mut messages = normalize_messages_for(
+            raw_messages,
+            self.tool_format,
+            preparation.ordered_assistant_parts,
+        )?;
         if self.audio.is_some() {
             for message in &mut messages {
                 if message["role"] == "user"
@@ -706,11 +711,13 @@ impl ChatCodec {
         } else {
             input
         };
-        if !explicit_limit {
+        if preparation.count_only {
+            max_tokens = 0;
+        } else if !explicit_limit {
             max_tokens = max_tokens.min(context_limit.saturating_sub(input.len()));
         }
         if input.is_empty()
-            || max_tokens == 0
+            || (max_tokens == 0 && !preparation.count_only)
             || input
                 .len()
                 .checked_add(max_tokens)
@@ -737,7 +744,10 @@ impl ChatCodec {
         // still governs reuse; retention hints cannot reserve memory or prevent
         // eviction. Neither field changes the prompt or sampling identity.
         let constrained_tools = constraint.is_some();
-        if thinking && let Some(budget) = request.thinking_token_budget {
+        if !preparation.count_only
+            && thinking
+            && let Some(budget) = request.thinking_token_budget
+        {
             if max_tokens < 2 {
                 return Err("max_completion_tokens: Thinking budget needs room for </think> and an answer token".into());
             }
@@ -800,6 +810,7 @@ impl ChatCodec {
         prefix_hints.dedup();
         let _ = request.user; // Attribution only; it does not alter sampling identity.
         Ok(Prepared {
+            native_events: false,
             tool_format: if self.tool_format == ToolFormat::DeepSeekV41
                 && !native_tools
                 && constraint.is_some()
@@ -920,9 +931,13 @@ fn text_content(v: &Value, separator: &str) -> Result<String> {
 }
 #[cfg(test)]
 fn normalize_messages(messages: Vec<Value>) -> Result<Vec<Value>> {
-    normalize_messages_for(messages, ToolFormat::Qwen)
+    normalize_messages_for(messages, ToolFormat::Qwen, false)
 }
-fn normalize_messages_for(mut messages: Vec<Value>, format: ToolFormat) -> Result<Vec<Value>> {
+fn normalize_messages_for(
+    mut messages: Vec<Value>,
+    format: ToolFormat,
+    ordered_assistant_parts: bool,
+) -> Result<Vec<Value>> {
     if messages.is_empty() {
         return Err("messages must not be empty".into());
     }
@@ -951,7 +966,10 @@ fn normalize_messages_for(mut messages: Vec<Value>, format: ToolFormat) -> Resul
         if role == "user" {
             user = true;
         }
-        if role != "tool" && !pending.is_empty() {
+        if role != "tool"
+            && !(ordered_assistant_parts && role == "assistant")
+            && !pending.is_empty()
+        {
             return Err("Missing response for preceding tool call".into());
         }
         message["content"] = json!(text_content(
