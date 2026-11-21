@@ -216,6 +216,60 @@ mod tests {
         })).unwrap()
     }
     #[test]
+    fn external_proposals_keep_verification_and_remove_native_warm_and_head() {
+        use crate::execution::{LoadOptions, SpecMethod};
+        for method in [
+            SpecMethod::Draft,
+            SpecMethod::Dflash,
+            SpecMethod::Dflash2,
+            SpecMethod::Dspark,
+            SpecMethod::PromptLookup,
+            SpecMethod::Mtp,
+        ] {
+            let mut m = manifest();
+            let mut v = spec();
+            v.draft_program = "draft".into();
+            for p in &mut v.warm_plans {
+                p.program = "warm".into();
+                p.head_program = "draft_head".into();
+            }
+            for p in &mut v.verification_plans {
+                p.program = "verify".into();
+                p.restore_program = "restore".into();
+                p.capture_program = "capture".into();
+            }
+            for name in [
+                "draft",
+                "warm",
+                "draft_head",
+                "verify",
+                "restore",
+                "capture",
+            ] {
+                m.programs.insert(name.into(), vec![]);
+            }
+            m.mtp = Some(v);
+            LoadOptions {
+                spec_method: Some(method),
+                mtp_drafts: Some(3),
+                ..Default::default()
+            }
+            .configure_mtp(&mut m)
+            .unwrap();
+            for name in ["verify", "restore", "capture"] {
+                assert!(m.programs.contains_key(name));
+            }
+            for name in ["draft", "warm", "draft_head"] {
+                assert_eq!(m.programs.contains_key(name), method == SpecMethod::Mtp);
+            }
+            assert_eq!(
+                !m.mtp.unwrap().warm_plans.is_empty(),
+                method == SpecMethod::Mtp
+            );
+        }
+    }
+
+    #[test]
     fn draft_override_uses_only_an_exact_package_profile() {
         use crate::execution::LoadOptions;
         let mut model = manifest();

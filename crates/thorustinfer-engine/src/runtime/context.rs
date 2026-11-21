@@ -3,6 +3,16 @@ use super::requests::GenerationInput;
 use super::*;
 use crate::execution::{ContextLimit, ContextOptions, ContextPlan};
 impl ModelRuntime {
+    pub(crate) fn context_resident(&self, features: usize) -> [usize; 3] {
+        let mut bytes = self.execution.context_resident();
+        if let Some(draft) = &self.external_draft {
+            for (n, other) in bytes.iter_mut().zip(draft.execution.context_resident()) {
+                *n += other;
+            }
+        }
+        bytes[2] += features;
+        bytes
+    }
     pub(crate) fn configure_context(
         &mut self,
         options: ContextOptions,
@@ -34,7 +44,7 @@ impl ModelRuntime {
             pool_bytes: 0,
             planned_growth_bytes: 0,
             other_worker_bytes: 0,
-            used: Default::default(),
+            ..Default::default()
         };
         if requested == 0
             && options.context != Some(ContextLimit::Auto)
@@ -79,7 +89,7 @@ impl ModelRuntime {
         if self.manifest.audio.is_some() {
             programs.extend(["audio_stem", "audio_encoder"]);
         }
-        let required = |n| -> Result<(u128, u128)> {
+        let required = |n| -> Result<(u128, u128, u128)> {
             let (mut fixed, mut kv, mut shared) = (0u128, 0u128, 0u128);
             for model in std::iter::once(self as &Self).chain(self.external_draft.as_deref()) {
                 let limits = model.request_limits(&input, n)?;
@@ -101,10 +111,11 @@ impl ModelRuntime {
                 shared += block.temporary_bytes(n)? as u128
                     + block.feature_bytes(n)? as u128 * (owners - 1) as u128;
             }
-            Ok((kv, fixed + shared))
+            Ok((kv, fixed, shared))
         };
         let fits = |n| -> Result<bool> {
-            let (kv, other) = required(n)?;
+            let (kv, fixed, shared) = required(n)?;
+            let other = fixed + shared;
             Ok((pool == 0 || kv <= pool as u128)
                 && other + if pool > 0 { pool as u128 } else { kv } <= available as u128)
         };
@@ -123,9 +134,13 @@ impl ModelRuntime {
                 "Context budget fits at most {low} tokens for {owners} owners; pool {pool}, available {available} bytes"
             ));
         }
-        let (kv, other) = required(plan.effective)?;
-        plan.planned_growth_bytes = usize::try_from(other + if pool == 0 { kv } else { 0 })
-            .map_err(|_| "Planned growth overflow")?;
+        let (kv, fixed, shared) = required(plan.effective)?;
+        plan.growth = [
+            if pool == 0 { kv as usize } else { 0 },
+            fixed as usize,
+            shared as usize,
+        ];
+        plan.planned_growth_bytes = plan.growth.iter().sum();
         if pool > 0 {
             plan.used = self.execution.reserve_kv_pool(pool)?;
             if let Some(draft) = &mut self.external_draft {
@@ -133,6 +148,8 @@ impl ModelRuntime {
             }
             plan.pool_bytes = pool;
         }
+        plan.baseline = self.context_resident(0);
+        plan.observe(plan.baseline);
         self.effective_context = plan.effective;
         Ok(plan)
     }

@@ -521,18 +521,7 @@ async fn batch(State(manager): State<Arc<Manager>>, Json(input): Json<Batch>) ->
             "Batch requires absolute file paths and auto/input order".into(),
         ));
     }
-    if let Err(e) = manager.stop(&input.name, false).await {
-        return result(Err(e));
-    }
-    let prepared = async {
-        let _transition = manager
-            .transition
-            .acquire()
-            .await
-            .map_err(|_| "Service is stopping")?;
-        if manager.stopping.load(Ordering::Acquire) {
-            return Err("Service is stopping".into());
-        }
+    let effective = async {
         let record = manager
             .records
             .lock()
@@ -547,13 +536,50 @@ async fn batch(State(manager): State<Arc<Manager>>, Json(input): Json<Batch>) ->
             .ok_or("Invalid model options")?
             .extend(input.options.clone());
         let options: WorkerOptions = serde_json::from_value(values).map_err(|e| e.to_string())?;
-        options.settings(&record.name, &record.path)?.validate()?;
+        if registry::model_identity(
+            &fs::read(record.path.join("cache/model.json")).map_err(|e| e.to_string())?,
+            &record.options,
+        )? != record.identity
+        {
+            return Err("Model identity changed; import the new version before loading".into());
+        }
+        let record = if input.options.is_empty() {
+            record
+        } else {
+            registry::inspect(&record.name, &record.path, options)?
+        };
+        Ok::<_, String>((key, record))
+    }
+    .await;
+    let (key, record) = match effective {
+        Ok(pair) => pair,
+        Err(e) => return result(Err(e)),
+    };
+    if let Err(e) = manager.stop(&input.name, false).await {
+        return result(Err(e));
+    }
+    let prepare = || async {
+        let _transition = manager
+            .transition
+            .acquire()
+            .await
+            .map_err(|_| "Service is stopping")?;
+        if manager.stopping.load(Ordering::Acquire) {
+            return Err("Service is stopping".into());
+        }
+        if !manager
+            .records
+            .lock()
+            .await
+            .get(&input.name)
+            .is_some_and(|current| runner_key(current) == key)
+        {
+            return Err("Model registration changed before batch startup".into());
+        }
         if manager.runners.lock().await.contains_key(&key) {
             return Err("Model acquired by another request; retry the batch job".into());
         }
-        manager.reserve_space(&record).await?;
-        let directory = manager.directory.join(&key[..16]);
-        private_directory(&directory)?;
+        let (budget, directory, mut command) = manager.prepare_worker(&record, &key).await?;
         let log = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -561,7 +587,6 @@ async fn batch(State(manager): State<Arc<Manager>>, Json(input): Json<Batch>) ->
             .map_err(|e| e.to_string())?;
         let report =
             fs::File::create(directory.join("batch-report.json")).map_err(|e| e.to_string())?;
-        let mut command = manager.command();
         command
             .arg("batch")
             .arg(&record.path)
@@ -577,7 +602,7 @@ async fn batch(State(manager): State<Arc<Manager>>, Json(input): Json<Batch>) ->
             .arg(&input.scheduler_policy)
             .arg("--gpu-lock")
             .arg(directory.join("gpu.lock"))
-            .args(options.arguments())
+            .args(record.options.arguments())
             .stdin(std::process::Stdio::null())
             .stdout(report)
             .stderr(log);
@@ -586,19 +611,21 @@ async fn batch(State(manager): State<Arc<Manager>>, Json(input): Json<Batch>) ->
         }
         let child = command.spawn().map_err(|e| e.to_string())?;
         let pid = child.id().ok_or("Batch worker did not start")?;
+        let load_bytes = record.start_bytes()?;
         let runner = Arc::new(Runner {
             key: key.clone(),
-            model: record.name,
+            model: record.name.clone(),
             child: Mutex::new(child),
             client: reqwest::Client::new(),
             active: AtomicUsize::new(1),
             effective_context: AtomicUsize::new(record.max_context),
             plans_capacity: record.options.context_options.plans_capacity(),
-            planned_growth: AtomicUsize::new(0),
+            load_bytes,
+            capacity_file: crate::capacity::path(&directory),
             last_used: SyncMutex::new(Instant::now()),
             keep_alive_s: AtomicU64::new(0),
             draining: AtomicBool::new(false),
-            loading: AtomicBool::new(false),
+            loading: AtomicBool::new(true),
             directory,
             pid,
             batch: true,
@@ -607,35 +634,75 @@ async fn batch(State(manager): State<Arc<Manager>>, Json(input): Json<Batch>) ->
             .runners
             .lock()
             .await
-            .insert(key, Arc::clone(&runner));
-        Ok(Lease(runner, None))
-    }
-    .await;
-    let lease = match prepared {
+            .insert(key.clone(), Arc::clone(&runner));
+        Ok((Lease(runner, None), budget))
+    };
+    let started = Instant::now();
+    let prepared = loop {
+        match prepare().await {
+            Err(e)
+                if e == "Model is loading"
+                    && started.elapsed() < Duration::from_secs(manager.config.load_timeout_s) =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await
+            }
+            other => break other,
+        }
+    };
+    let (lease, mut budget) = match prepared {
         Ok(lease) => lease,
         Err(e) => {
             manager.release_gpu_if_idle().await;
             return result(Err(e));
         }
     };
-    let status = loop {
-        match lease.0.child.lock().await.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(e) => return result(Err(e.to_string())),
+    // The manager owns cleanup even if the HTTP caller disconnects.
+    match tokio::spawn(async move {
+        let status = loop {
+            if lease.0.loading.load(Ordering::Acquire) {
+                match crate::capacity::read(&lease.0.capacity_file) {
+                    Ok(Some(plan)) => {
+                        lease
+                            .0
+                            .effective_context
+                            .store(plan.effective, Ordering::Release);
+                        let _ = manager.publish_ready(&lease.0, &mut budget).await;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _transition = manager.transition.acquire().await;
+                        let _ = manager.remove_runner(&lease.0).await;
+                        return result(Err(error));
+                    }
+                }
+            }
+            match lease.0.child.lock().await.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {}
+                Err(e) => break Err(e),
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let report = fs::read(lease.0.directory.join("batch-report.json"))
+            .map_err(|e| e.to_string())
+            .and_then(|raw| serde_json::from_slice::<Value>(&raw).map_err(|e| e.to_string()));
+        let _transition = manager.transition.acquire().await;
+        if let Err(e) = manager.remove_runner(&lease.0).await {
+            return result(Err(e));
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-    let report = fs::read(lease.0.directory.join("batch-report.json"))
-        .map_err(|e| e.to_string())
-        .and_then(|raw| serde_json::from_slice::<Value>(&raw).map_err(|e| e.to_string()));
-    let _transition = manager.transition.acquire().await;
-    if let Err(e) = manager.remove_runner(&lease.0).await {
-        return result(Err(e));
-    }
-    match report {
-        Ok(report) => Json(json!({"success":status.success(),"report":report})).into_response(),
-        Err(e) => result(Err(format!("Batch worker {status}: {e}"))),
+        let status = match status {
+            Ok(v) => v,
+            Err(e) => return result(Err(e.to_string())),
+        };
+        match report {
+            Ok(report) => Json(json!({"success":status.success(),"report":report})).into_response(),
+            Err(e) => result(Err(format!("Batch worker {status}: {e}"))),
+        }
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => result(Err(error.to_string())),
     }
 }
 

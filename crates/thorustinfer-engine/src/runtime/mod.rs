@@ -243,6 +243,12 @@ impl ModelRuntime {
         self.confidence = confidence;
         Ok(())
     }
+    fn native_mtp(&self) -> Option<&crate::mtp::Spec> {
+        self.manifest
+            .mtp
+            .as_ref()
+            .filter(|s| !s.warm_plans.is_empty())
+    }
     fn independent_draft(&self) -> bool {
         self.external_draft.is_some() || self.block_draft.is_some()
     }

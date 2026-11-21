@@ -79,11 +79,27 @@ pub struct ContextPlan {
     pub pool_bytes: usize,
     pub planned_growth_bytes: usize,
     pub other_worker_bytes: usize,
+    pub(crate) baseline: [usize; 3],
+    pub(crate) growth: [usize; 3],
+    pub(crate) remaining: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     pub used: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 impl ContextPlan {
+    pub fn remaining_growth_bytes(&self) -> usize {
+        self.remaining.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(crate) fn observe(&self, resident: [usize; 3]) {
+        let remaining = self
+            .growth
+            .iter()
+            .enumerate()
+            .map(|(i, &budget)| budget.saturating_sub(resident[i].saturating_sub(self.baseline[i])))
+            .sum();
+        self.remaining
+            .store(remaining, std::sync::atomic::Ordering::Release);
+    }
     pub fn report(&self) -> serde_json::Value {
-        serde_json::json!({"package_context":self.package,"effective_context":self.effective,"planning_concurrency":self.owners,"requested_kv_bytes":self.requested_bytes,"pool_bytes":self.pool_bytes,"planned_growth_bytes":self.planned_growth_bytes,"other_worker_bytes":self.other_worker_bytes,"used_pool_bytes":self.used.load(std::sync::atomic::Ordering::Relaxed)})
+        serde_json::json!({"package_context":self.package,"effective_context":self.effective,"planning_concurrency":self.owners,"requested_kv_bytes":self.requested_bytes,"pool_bytes":self.pool_bytes,"planned_growth_bytes":self.planned_growth_bytes,"remaining_growth_bytes":self.remaining_growth_bytes(),"other_worker_bytes":self.other_worker_bytes,"used_pool_bytes":self.used.load(std::sync::atomic::Ordering::Relaxed)})
     }
 }
 
@@ -230,7 +246,7 @@ impl LoadOptions {
             return Ok(());
         };
         if drafts == 0 {
-            disable_mtp(manifest);
+            prune_mtp(manifest, false);
             return Ok(());
         }
         if drafts > MAX_MTP_DRAFTS {
@@ -252,11 +268,17 @@ impl LoadOptions {
             ));
         }
         spec.default_verification_tokens = rows;
+        if self
+            .spec_method
+            .is_some_and(|m| m.uses_draft_model() || m == SpecMethod::PromptLookup)
+        {
+            prune_mtp(manifest, true);
+        }
         Ok(())
     }
 }
 
-fn disable_mtp(manifest: &mut crate::model::Manifest) {
+fn prune_mtp(manifest: &mut crate::model::Manifest, keep_verifier: bool) {
     use crate::model::Operation;
     use std::collections::BTreeSet;
     let Some(spec) = manifest.mtp.take() else {
@@ -283,18 +305,39 @@ fn disable_mtp(manifest: &mut crate::model::Manifest) {
             .reset_buffers
             .retain(|name| !draft_kv.contains(name));
     }
-    let mut disabled = BTreeSet::from([spec.draft_program]);
-    disabled.extend(spec.batch_programs);
+    let mut disabled = BTreeSet::from([spec.draft_program.clone()]);
+    if keep_verifier {
+        let mut verifier = spec.clone();
+        verifier.warm_plans.clear();
+        verifier.batch_warm = false;
+        verifier.batch_draft_profiles.clear();
+        verifier.draft_snapshot_program = None;
+        verifier.draft_restore_program = None;
+        manifest.mtp = Some(verifier);
+    } else {
+        disabled.extend(spec.batch_programs);
+    }
     disabled.extend(spec.draft_snapshot_program);
     disabled.extend(spec.draft_restore_program);
     for p in spec.warm_plans {
         disabled.extend([p.program, p.head_program]);
     }
-    for p in spec.verification_plans {
-        disabled.extend([p.program, p.restore_program, p.capture_program]);
+    if !keep_verifier {
+        for p in spec.verification_plans {
+            disabled.extend([p.program, p.restore_program, p.capture_program]);
+        }
     }
     // Target capture is also a dependency of architecture-owned batch plans.
     let mut required: BTreeSet<_> = spec.capture_plans.into_iter().map(|p| p.program).collect();
+    if let Some(verifier) = &manifest.mtp {
+        for plan in &verifier.verification_plans {
+            required.extend([
+                plan.program.clone(),
+                plan.restore_program.clone(),
+                plan.capture_program.clone(),
+            ]);
+        }
+    }
     required.extend(["decode".into(), "prefill".into(), "head".into()]);
     for p in &manifest.prefill_plans {
         required.extend([p.prefill_program.clone(), p.head_program.clone()]);
@@ -528,5 +571,24 @@ mod tests {
             assert!(CudaGraphMode::Full.uses_graph(phase));
             assert!(!CudaGraphMode::Off.uses_graph(phase));
         }
+    }
+}
+
+#[cfg(test)]
+mod context_growth_tests {
+    use super::ContextPlan;
+    #[test]
+    fn physical_growth_is_credited_only_to_its_own_planned_component() {
+        let plan = ContextPlan {
+            baseline: [0, 20, 30],
+            growth: [0, 100, 80],
+            ..Default::default()
+        };
+        plan.observe([4096, 80, 300]);
+        assert_eq!(plan.remaining_growth_bytes(), 40);
+        plan.observe([4096, 20, 40]);
+        assert_eq!(plan.remaining_growth_bytes(), 170);
+        plan.observe([0, 0, 0]);
+        assert_eq!(plan.remaining_growth_bytes(), 180);
     }
 }

@@ -122,6 +122,7 @@ pub(super) struct Sequence {
     pub leased: bool,
     pub quarantined: bool,
     fixed_allocation: Option<u64>,
+    fixed_arena_bytes: usize,
     fixed_slices: std::collections::BTreeSet<String>,
 }
 impl Sequence {
@@ -617,6 +618,7 @@ impl Executor {
                     self.session.buffers.push(owner);
                     allocated.push(owner);
                     sequence.fixed_allocation = Some(owner);
+                    sequence.fixed_arena_bytes = layout.allocation_bytes;
                     check(
                         sys::cuMemsetD8Async(
                             owner,
@@ -921,6 +923,61 @@ impl Executor {
                 .map(|v| v.mapped.saturating_sub(v.physical_bytes()))
                 .sum::<usize>()
     }
+    /// Physical bytes that back the three quantities in the context planner.
+    /// Exclude fixed-address aliases and the already-paid KV pool.
+    pub(crate) fn context_resident(&self) -> [usize; 3] {
+        let fixed = self
+            .sequences
+            .iter()
+            .map(|s| {
+                s.fixed_arena_bytes
+                    + s.sizes
+                        .iter()
+                        .filter(|(name, _)| {
+                            !self.sequence_strides.contains_key(*name)
+                                && !s.fixed_slices.contains(*name)
+                        })
+                        .map(|(_, bytes)| bytes)
+                        .sum::<usize>()
+            })
+            .sum();
+        let buffers = self.session.virtual_buffers.borrow();
+        let kv = if self.session.kv_pool.is_some() {
+            0
+        } else {
+            buffers
+                .iter()
+                .filter(|(n, _)| self.sequence_strides.contains_key(*n))
+                .map(|(_, r)| r.physical_bytes())
+                .sum::<usize>()
+                + self
+                    .sequences
+                    .iter()
+                    .flat_map(|s| s.reservations.values())
+                    .map(|r| r.physical_bytes())
+                    .sum::<usize>()
+                + self
+                    .session
+                    .prefix_buffers
+                    .borrow()
+                    .values()
+                    .map(|r| r.physical_bytes())
+                    .sum::<usize>()
+        };
+        let shared = self
+            .session
+            .workspace_buffers
+            .borrow()
+            .values()
+            .map(|r| r.physical_bytes())
+            .sum::<usize>()
+            + buffers
+                .iter()
+                .filter(|(name, _)| self.prefill_workspace.contains(*name))
+                .map(|(_, r)| r.physical_bytes())
+                .sum::<usize>();
+        [kv, fixed, shared]
+    }
     pub(crate) fn active_kv_bytes(&self) -> usize {
         // Shared pages are cache-owned. Retain the private replacement budget
         // until the request finishes, including worst-case COW writes.
@@ -1090,6 +1147,7 @@ impl Executor {
                 }
                 self.session.buffers.retain(|&p| p != owner);
                 self.sequences[slot].fixed_allocation = None;
+                self.sequences[slot].fixed_arena_bytes = 0;
                 self.sequences[slot].fixed_slices.clear();
             }
             self.sequences[slot].quarantined = false;

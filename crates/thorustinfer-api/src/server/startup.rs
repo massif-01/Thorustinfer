@@ -49,7 +49,6 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
     let (ready_sender, ready_receiver) = oneshot::channel();
     let model_id: Arc<str> = settings.model.clone().into();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let worker_model = Arc::clone(&model_id);
     let worker_shutdown = Arc::clone(&shutdown);
     let scheduler = settings.scheduler;
     let verify_weights = settings.verify_weights;
@@ -125,6 +124,11 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
                             "WARMUP READY after {:.3}s",
                             warm_started.elapsed().as_secs_f64()
                         );
+                        let mut capacity=crate::capacity::Publisher::new(context_plan.clone());
+                        if let Err(error)=capacity.update(&loaded.model,0) {
+                            worker_lifecycle.fail(thorustinfer_engine::error::EngineError::take(error.clone(),true));
+                            let _=ready_sender.send(Err(error)); return;
+                        }
                         worker_lifecycle.ready();
                         let mtp_drafts = loaded.model.mtp_drafts();
                         let ready = (context, context_plan, vision, mtp_drafts, Arc::clone(&worker_codec));
@@ -133,9 +137,9 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
                                 &mut loaded.model,
                                 receiver,
                                 &worker_codec,
-                                &worker_model,
+                                &settings,
                                 &worker_shutdown,
-                                scheduler,
+                                capacity,
                                 &worker_activity,
                             );
                         }
@@ -238,11 +242,6 @@ fn load_model(settings: &Settings) -> Result<LoadedModel> {
         spec_method: settings.spec_method,
         prompt_lookup: settings.prompt_lookup,
     };
-    if let Some(draft) = &settings.draft_model
-        && settings.spec_method == Some(thorustinfer_engine::execution::SpecMethod::Draft)
-    {
-        check_draft_tokenizer(&settings.model_dir, draft)?;
-    }
     let model = Model::load_with_draft(
         &settings.model_dir,
         options,
@@ -254,32 +253,6 @@ fn load_model(settings: &Settings) -> Result<LoadedModel> {
         _lock: lock,
         seconds: at.elapsed().as_secs_f64(),
     })
-}
-
-fn check_draft_tokenizer(target: &std::path::Path, draft: &std::path::Path) -> Result<()> {
-    fn semantics(path: &std::path::Path) -> Result<(serde_json::Value, Vec<serde_json::Value>)> {
-        let tok = tokenizers::Tokenizer::from_file(path.join("tokenizer.json"))
-            .map_err(|e| e.to_string())?;
-        let tokenizer = serde_json::to_value(tok).map_err(|e| e.to_string())?;
-        let config: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(path.join("generation_config.json")).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        Ok((
-            tokenizer,
-            ["eos_token_id", "bos_token_id", "pad_token_id"]
-                .iter()
-                .map(|&k| config[k].clone())
-                .collect(),
-        ))
-    }
-    if semantics(target)? != semantics(draft)? {
-        return Err(
-            "Draft tokenizer ID mapping, special tokens, or tokenization rules differ from target"
-                .into(),
-        );
-    }
-    Ok(())
 }
 
 fn load_frontend(settings: &Settings) -> Result<Arc<ChatCodec>> {

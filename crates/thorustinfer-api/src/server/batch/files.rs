@@ -239,6 +239,17 @@ impl Journal {
                 File::open(&meta).map_err(|e| format!("Open resume identity: {e}"))?,
             )
             .map_err(|e| e.to_string())?;
+            if stored.get("effective_context") != identity.get("effective_context") {
+                return Err(format!(
+                    "Resume effective context mismatch: journal {}, worker {}",
+                    stored
+                        .get("effective_context")
+                        .map_or_else(|| "unspecified".to_owned(), Value::to_string),
+                    identity
+                        .get("effective_context")
+                        .map_or_else(|| "fixed".to_owned(), Value::to_string)
+                ));
+            }
             if &stored != identity {
                 return Err(
                     "Resume identity mismatch: input, model or request defaults changed".into(),

@@ -1,4 +1,5 @@
 //! CPU-side OpenAI Chat protocol adapter. GPU execution belongs to thorustinfer-engine.
+mod capacity;
 mod config;
 pub mod embeddings;
 mod encoder_service;

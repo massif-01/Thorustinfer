@@ -91,7 +91,7 @@ impl ModelRuntime {
         &mut self,
         requests: &mut [&mut RequestState],
     ) -> Result<()> {
-        let Some(spec) = self.manifest.mtp.clone() else {
+        let Some(spec) = self.native_mtp().cloned() else {
             return Ok(());
         };
         let Some(ring) = spec
@@ -1317,7 +1317,7 @@ impl ModelRuntime {
         head: bool,
         cursors: Option<[i32; 2]>,
     ) -> Result<bool> {
-        let Some(spec) = self.manifest.mtp.clone() else {
+        let Some(spec) = self.native_mtp().cloned() else {
             return Ok(true);
         };
         let [position, draft_position] = match cursors {
@@ -1920,6 +1920,9 @@ impl ModelRuntime {
         req.mtp.restore_s += at.elapsed().as_secs_f64();
         req.history.extend_from_slice(committed);
         req.generated += committed.len();
+        if self.native_mtp().is_none() {
+            return Ok(());
+        }
         let at = Instant::now();
         if !*is_lookup && let Some(restore) = &spec.draft_restore_program {
             self.launch_program(restore, ExecutionPhase::Decode)?;
@@ -1936,7 +1939,9 @@ impl ModelRuntime {
         position: Option<usize>,
     ) -> Result<Vec<u32>> {
         let committed = round.tokens;
-        req.warm.tokens = round.position + committed.len();
+        if self.native_mtp().is_some() {
+            req.warm.tokens = round.position + committed.len();
+        }
         self.execution.upload_sequence_ids(
             req.slot,
             &self.manifest.token,
@@ -1959,6 +1964,9 @@ impl ModelRuntime {
         restored: bool,
     ) -> Result<Vec<u32>> {
         self.restore_verified_cursor(req, &round, restored)?;
+        if self.native_mtp().is_none() {
+            return self.finish_warmed_commit(req, round, None);
+        }
         let spec = self.manifest.mtp.clone().ok_or("Missing MTP adapter")?;
         if self.manifest.packet_table().is_some() {
             let committed = (0, round);

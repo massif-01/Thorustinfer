@@ -63,6 +63,9 @@ impl std::ops::DerefMut for RequestState {
     }
 }
 impl RequestState {
+    pub fn feature_history_bytes(&self) -> usize {
+        self.features.as_ref().map_or(0, |h| h.allocated_bytes())
+    }
     pub fn computed_prompt_tokens(&self) -> usize {
         self.core
             .offset
@@ -714,7 +717,7 @@ impl ModelRuntime {
                 self.restore_prefix(&input.input_tokens, &media, &mut prefix)?;
             if offset > 0
                 && offset < input.input_tokens.len()
-                && let Some(spec) = self.manifest.mtp.clone()
+                && let Some(spec) = self.native_mtp().cloned()
             {
                 if warm.tokens != offset - 1 {
                     return Err("Restored prefix contains an inconsistent MTP cursor".into());
@@ -970,7 +973,7 @@ impl ModelRuntime {
             return Err("Request prefill position mismatch".into());
         }
         let checkpoint = req.checkpoints.contains(&req.offset);
-        if let Some(spec) = self.manifest.mtp.clone() {
+        if let Some(spec) = self.native_mtp().cloned() {
             let at = Instant::now();
             // A checkpoint must exclude the next prompt token from the draft
             // state. A different continuation can restore this same prefix.
@@ -1011,7 +1014,7 @@ impl ModelRuntime {
             // This consumes h[P-1] before the next target block can overwrite
             // its slot in the bounded hidden ring.
             if req.offset < req.input.len()
-                && let Some(spec) = self.manifest.mtp.clone()
+                && let Some(spec) = self.native_mtp().cloned()
             {
                 let at = Instant::now();
                 self.mtp_warm_state(
@@ -1032,7 +1035,7 @@ impl ModelRuntime {
         }
     }
     fn complete_prefill(&mut self, req: &mut RequestState) -> Result<Vec<u32>> {
-        if let Some(spec) = self.manifest.mtp.clone() {
+        if let Some(spec) = self.native_mtp().cloned() {
             let shifted = &req.input[req.warm.tokens + 1..];
             if !shifted.is_empty() {
                 let at = Instant::now();
@@ -1063,7 +1066,7 @@ impl ModelRuntime {
         req.history.push(pending);
         req.generated += 1;
         req.prefilling = false;
-        if let Some(spec) = self.manifest.mtp.clone() {
+        if let Some(spec) = self.native_mtp().cloned() {
             req.mtp.initial_warm_s = req.warm.seconds;
             // Sampled lookup reads target state only. The hidden ring can
             // supply this endpoint when model drafting or a checkpoint needs it.

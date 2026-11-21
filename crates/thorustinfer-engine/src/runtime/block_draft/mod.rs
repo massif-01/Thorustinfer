@@ -568,6 +568,9 @@ pub(super) struct FeatureHistory {
     values: Vec<f32>,
 }
 impl FeatureHistory {
+    pub(super) fn allocated_bytes(&self) -> usize {
+        std::mem::size_of_val(self.values.as_slice())
+    }
     pub(super) fn release(&mut self, model: &mut ModelRuntime) -> Result<()> {
         if let Some(slot) = self.slot {
             model

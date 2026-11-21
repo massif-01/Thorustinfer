@@ -428,11 +428,13 @@ pub(super) fn worker(
     model: &mut Model,
     mut jobs: mpsc::Receiver<Job>,
     codec: &ChatCodec,
-    model_id: &str,
+    settings: &Settings,
     shutdown: &AtomicBool,
-    options: scheduler::Options,
+    mut capacity: crate::capacity::Publisher,
     activity: &Activity,
 ) {
+    let model_id = settings.model.as_str();
+    let options = settings.scheduler;
     let lifecycle = &activity.lifecycle;
     let mut waiting: Vec<Job> = vec![];
     let mut active: Vec<Active<'_>> = vec![];
@@ -443,6 +445,16 @@ pub(super) fn worker(
     let defer_output = std::env::var("THORUSTINFER_ASYNC_OUTPUT").as_deref() != Ok("0");
     let mut output_pipeline = pipeline::Statistics::default();
     loop {
+        if let Err(error) = capacity.update(
+            model,
+            active
+                .iter()
+                .map(|a| a.request.feature_history_bytes())
+                .sum(),
+        ) {
+            lifecycle.fail(thorustinfer_engine::error::EngineError::take(error, true));
+            break;
+        }
         if shutdown.load(Ordering::Relaxed) || !lifecycle.is_ready() {
             break;
         }
@@ -877,6 +889,10 @@ pub(super) fn worker(
                 *statistics = output_pipeline.clone();
             }
         } else if waiting.is_empty() && completed.is_empty() {
+            if let Err(error) = capacity.update(model, 0) {
+                lifecycle.fail(thorustinfer_engine::error::EngineError::take(error, true));
+                break;
+            }
             let Some(job) = jobs.blocking_recv() else {
                 break;
             };

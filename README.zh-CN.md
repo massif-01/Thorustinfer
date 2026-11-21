@@ -107,7 +107,7 @@ Qwen3.5-4B 在 T5000 上测过两档：`e8p` 使用 E8P Q4A8，`w4a4` 使用原�
 | `--context N\|auto` | 指定单请求上限，或计算执行包、物理内存和 KV 预算能容纳的最大长度。显式设置无法兑现时在启动阶段报错。 |
 | `--context-concurrency C` | 为 C 个同时达到上限的请求规划容量，默认 1，最高为 `--max-active-requests`。短请求仍可利用剩余容量。 |
 
-独立服务、注册模型的管理模式和离线 batch 使用相同参数。管理器会让需要规划容量的 worker 与其他 worker 错开启动。已就绪 worker 的 `planned_growth_bytes` 单列后续按需增长预算，新 worker 计算上限时扣除这部分空间，已预分配的物理池另计。在 worker 的 `/health` 中读取 `context_plan`，可查看包上限、生效上限、规划并发、请求池字节数、对齐后的实际池字节数和当前占用。`--prefix-cache-mib` 控制快照保留容量，`--memory-reserve-mib` 控制系统预留内存。
+独立服务、注册模型的管理模式和离线 batch 使用相同参数。管理器会让需要规划容量的 worker 与其他 worker 错开启动。HTTP 和 batch worker 按生效配置发布上下文上限与增长预算。`remaining_growth_bytes` 随实际映射和释放更新，管理器按尚未兑现的部分计费。自动规划的 batch 续跑需要本次有效 token 上限与上次一致。在 worker 的 `/health` 中读取 `context_plan`，可查看包上限、生效上限、规划并发、请求池字节数、对齐后的实际池字节数和当前占用。`--prefix-cache-mib` 控制快照保留容量，`--memory-reserve-mib` 控制系统预留内存。
 
 ## 推测解码
 
