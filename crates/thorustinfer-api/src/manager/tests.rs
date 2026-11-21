@@ -243,3 +243,35 @@ fn request_budgets_are_global_and_released_on_cancellation() {
             .is_err()
     );
 }
+
+#[test]
+fn growth_and_request_tickets_charge_only_unmaterialized_bytes_per_owner() {
+    let fixture = Fixture::new();
+    let file = fixture.root.join("capacity.json");
+    let mut ledger = BudgetTotals {
+        loading: 7,
+        requests: 95,
+        request_by_owner: BTreeMap::from([("planned".into(), 80), ("ordinary".into(), 15)]),
+        plans: BTreeMap::from([("planned".into(), file.clone())]),
+    };
+    let publish = |remaining| {
+        fs::write(
+            &file,
+            serde_json::to_vec(&crate::capacity::Snapshot {
+                effective: 200,
+                planned: 100,
+                remaining,
+            })
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    publish(40);
+    assert_eq!(ledger.charged(None).unwrap(), 7 + 15 + 40);
+    assert_eq!(ledger.charged(Some(("planned", 30))).unwrap(), 7 + 15 + 50);
+    assert_eq!(ledger.charged(Some(("ordinary", 30))).unwrap(), 7 + 45 + 40);
+    publish(90);
+    assert_eq!(ledger.charged(None).unwrap(), 7 + 15 + 90);
+    ledger.plans.clear();
+    assert_eq!(ledger.charged(None).unwrap(), 7 + 95);
+}

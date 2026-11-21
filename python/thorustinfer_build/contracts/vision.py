@@ -5,16 +5,19 @@ import math
 
 def validate_vision(vision, output_hidden):
     if (
-        vision["num_heads"],
         vision["in_channels"],
         vision["patch_size"],
         vision["spatial_merge_size"],
         vision["temporal_patch_size"],
         vision["out_hidden_size"],
         vision["hidden_act"],
-    ) != (16, 3, 16, 2, 2, output_hidden, "gelu_pytorch_tanh") or vision["hidden_size"] not in (
-        1024,
-        1152,
+    ) != (3, 16, 2, 2, output_hidden, "gelu_pytorch_tanh") or (
+        vision["hidden_size"],
+        vision["num_heads"],
+    ) not in (
+        (768, 12),
+        (1024, 16),
+        (1152, 16),
     ):
         raise ValueError("Unsupported vision architecture; need an explicit adapter")
     positions = vision["num_position_embeddings"]

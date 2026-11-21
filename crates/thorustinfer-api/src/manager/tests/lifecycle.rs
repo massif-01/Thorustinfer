@@ -337,6 +337,8 @@ async fn pending_load_reservations_prevent_double_promising_memory_and_release_o
     let reserved = usize::MAX / 2;
     fixture.manager.budgets.lock().unwrap().loading = reserved;
     let budget = MemoryBudget {
+        prior: 0,
+        owner: None,
         bytes: reserved,
         kind: BudgetKind::Loading,
         total: Arc::clone(&fixture.manager.budgets),

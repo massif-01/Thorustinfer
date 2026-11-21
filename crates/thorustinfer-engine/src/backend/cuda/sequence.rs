@@ -122,6 +122,7 @@ pub(super) struct Sequence {
     pub leased: bool,
     pub quarantined: bool,
     fixed_allocation: Option<u64>,
+    fixed_arena_bytes: usize,
     fixed_slices: std::collections::BTreeSet<String>,
 }
 impl Sequence {
@@ -532,11 +533,12 @@ impl Executor {
                             self.sizes.insert(name, bytes);
                             continue;
                         }
-                        let replacement = super::virtual_memory::Reservation::reserve(
+                        let mut replacement = super::virtual_memory::Reservation::reserve(
                             &self.session,
                             bytes,
                             stride,
                         )?;
+                        replacement.pool = self.session.kv_pool.clone();
                         let address = replacement.address;
                         let retired = format!("@retired/{slot}/{name}");
                         let old = self
@@ -616,6 +618,7 @@ impl Executor {
                     self.session.buffers.push(owner);
                     allocated.push(owner);
                     sequence.fixed_allocation = Some(owner);
+                    sequence.fixed_arena_bytes = layout.allocation_bytes;
                     check(
                         sys::cuMemsetD8Async(
                             owner,
@@ -637,8 +640,9 @@ impl Executor {
                     base.checked_add(offset as u64)
                         .ok_or("Request arena address overflow")?
                 } else if let Some(&stride) = self.sequence_strides.get(&b.name) {
-                    let r =
+                    let mut r =
                         super::virtual_memory::Reservation::reserve(&self.session, bytes, stride)?;
+                    r.pool = self.session.kv_pool.clone();
                     let address = r.address;
                     sequence.reservations.insert(b.name.clone(), r);
                     address
@@ -828,6 +832,54 @@ impl Executor {
         self.batch_statistics.set(statistics);
         self.destroy_graphs(&execs)
     }
+    pub(crate) fn kv_granularity(&self) -> Result<usize> {
+        let buffers = self.session.virtual_buffers.borrow();
+        let key = self
+            .sequence_strides
+            .keys()
+            .next()
+            .ok_or("Model declares no private demand-mapped KV buffers")?;
+        Ok(buffers
+            .get(key)
+            .ok_or("Missing KV reservation")?
+            .granularity)
+    }
+    pub(crate) fn reserve_kv_pool(
+        &mut self,
+        bytes: usize,
+    ) -> Result<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
+        let pool = super::virtual_memory::PagePool::create(
+            self.session.device,
+            self.kv_granularity()?,
+            bytes,
+        )?;
+        let used = pool.used.clone();
+        self.bind_kv_pool(pool)?;
+        Ok(used)
+    }
+    pub(crate) fn share_kv_pool(&self, other: &mut Self) -> Result<()> {
+        let pool = self
+            .session
+            .kv_pool
+            .clone()
+            .ok_or("Missing worker KV pool")?;
+        other.bind_kv_pool(pool)
+    }
+    fn bind_kv_pool(&mut self, pool: std::rc::Rc<super::virtual_memory::PagePool>) -> Result<()> {
+        for (name, r) in self.session.virtual_buffers.get_mut() {
+            if self.sequence_strides.contains_key(name) {
+                if r.has_slabs() {
+                    return Err("KV pool must precede request mapping".into());
+                }
+                r.pool = Some(pool.clone());
+            }
+        }
+        self.session.kv_pool = Some(pool);
+        Ok(())
+    }
+    pub(crate) fn pool_free_bytes(&self) -> Option<usize> {
+        self.session.kv_pool.as_ref().map(|p| p.free_bytes())
+    }
     pub(crate) fn reserved_kv_bytes(&self, tokens: usize) -> Result<usize> {
         self.sequence_strides.keys().try_fold(0usize, |sum, name| {
             let r = self.session.virtual_buffers.borrow();
@@ -870,6 +922,61 @@ impl Executor {
                 .flat_map(|s| s.reservations.values())
                 .map(|v| v.mapped.saturating_sub(v.physical_bytes()))
                 .sum::<usize>()
+    }
+    /// Physical bytes that back the three quantities in the context planner.
+    /// Exclude fixed-address aliases and the already-paid KV pool.
+    pub(crate) fn context_resident(&self) -> [usize; 3] {
+        let fixed = self
+            .sequences
+            .iter()
+            .map(|s| {
+                s.fixed_arena_bytes
+                    + s.sizes
+                        .iter()
+                        .filter(|(name, _)| {
+                            !self.sequence_strides.contains_key(*name)
+                                && !s.fixed_slices.contains(*name)
+                        })
+                        .map(|(_, bytes)| bytes)
+                        .sum::<usize>()
+            })
+            .sum();
+        let buffers = self.session.virtual_buffers.borrow();
+        let kv = if self.session.kv_pool.is_some() {
+            0
+        } else {
+            buffers
+                .iter()
+                .filter(|(n, _)| self.sequence_strides.contains_key(*n))
+                .map(|(_, r)| r.physical_bytes())
+                .sum::<usize>()
+                + self
+                    .sequences
+                    .iter()
+                    .flat_map(|s| s.reservations.values())
+                    .map(|r| r.physical_bytes())
+                    .sum::<usize>()
+                + self
+                    .session
+                    .prefix_buffers
+                    .borrow()
+                    .values()
+                    .map(|r| r.physical_bytes())
+                    .sum::<usize>()
+        };
+        let shared = self
+            .session
+            .workspace_buffers
+            .borrow()
+            .values()
+            .map(|r| r.physical_bytes())
+            .sum::<usize>()
+            + buffers
+                .iter()
+                .filter(|(name, _)| self.prefill_workspace.contains(*name))
+                .map(|(_, r)| r.physical_bytes())
+                .sum::<usize>();
+        [kv, fixed, shared]
     }
     pub(crate) fn active_kv_bytes(&self) -> usize {
         // Shared pages are cache-owned. Retain the private replacement budget
@@ -1040,6 +1147,7 @@ impl Executor {
                 }
                 self.session.buffers.retain(|&p| p != owner);
                 self.sequences[slot].fixed_allocation = None;
+                self.sequences[slot].fixed_arena_bytes = 0;
                 self.sequences[slot].fixed_slices.clear();
             }
             self.sequences[slot].quarantined = false;
@@ -1057,6 +1165,14 @@ impl Executor {
         }
         self.sequences[slot].quarantined = false;
         self.sequences[slot].leased = false;
+        if self.session.kv_pool.is_some() {
+            self.sync()?;
+            for (name, r) in self.session.virtual_buffers.get_mut() {
+                if self.sequence_strides.contains_key(name) {
+                    r.release_slabs(&self.session.driver)?;
+                }
+            }
+        }
         Ok(())
     }
     #[cfg(test)]

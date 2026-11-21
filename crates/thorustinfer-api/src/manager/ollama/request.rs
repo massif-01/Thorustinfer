@@ -1,4 +1,4 @@
-use super::{Kind, ModelRecord, Result};
+use super::{Kind, Result};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -60,13 +60,13 @@ pub(in crate::manager) struct Native {
     num_ctx: Option<u64>,
 }
 impl Native {
-    pub fn validate(&self, record: &ModelRecord) -> Result<()> {
+    pub fn validate(&self, max_context: usize) -> Result<()> {
         if let Some(context) = self.num_ctx
-            && context != record.max_context as u64
+            && context != max_context as u64
         {
             return Err(format!(
                 "options.num_ctx: this model uses a fixed context limit of {}; omit num_ctx or use this value",
-                record.max_context
+                max_context
             ));
         }
         Ok(())

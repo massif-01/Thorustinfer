@@ -99,22 +99,10 @@ def publish(e8p, package, encoded, output):
         share(f, weights / f.name)
     (weights / "model.safetensors.index.json").write_bytes(json_bytes(index))
     pkg["compute_policy"] = desc["compute_policy"] = POLICY
-    # Prefix snapshots enumerate kv_cache.buffers. Target-only packages must not
-    # advertise the four draft pages, which no target program grows or maps.
-    desc["metadata"].pop("mtp")
-    draft_pages = {"MtpKPages", "MtpVPages", "MtpKPagesScale", "MtpVPagesScale"}
-    for name in draft_pages:
-        del desc["metadata"]["kv_cache"]["buffers"][name]
-
-    desc["metadata"]["reset_buffers"] = [
-        n for n in desc["metadata"]["reset_buffers"] if n not in draft_pages
-    ]
-    # Indirect packet kernels retain the common column ABI. Only their address
-    # slots survive; no target operation accesses draft KV data.
-    for table in (desc["metadata"]["buffers"], pkg["buffer_contracts"]):
-        for buf in table:
-            if buf["name"] in draft_pages:
-                buf["shape"] = [1]
+    spec = desc["metadata"]["mtp"]
+    if not spec["verification_plans"] or not spec["draft_program"] or not spec["warm_plans"]:
+        raise ValueError("Expected the base Qwen target verifier and a native MTP head")
+    pkg["toolchain"].update(target_verification="qwen_rows", native_draft="mtp")
     desc["metadata"]["weight_scope"] += (
         "; 32 target FFNs use BF16-origin NVFP4 W4A4, per-16 E4M3 and FP32 tensor scales"
     )
@@ -151,7 +139,6 @@ def publish(e8p, package, encoded, output):
     }
     b["templates"].remove(templates["/post/up"])
     b["templates"].remove(templates["/post/swiglu_quantize"])
-    b["templates"] = [t for t in b["templates"] if not t["prefix"].startswith("qwen_rows/mtp/")]
     for name in ("gate", "down"):
         gate = name == "gate"
         operation = "gate_up" if gate else "down"

@@ -7,8 +7,149 @@ pub use thorustinfer_device::GraphMode;
 /// Compatibility name for existing callers and serialized load options.
 pub type CudaGraphMode = GraphMode;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "serde_json::Value", into = "serde_json::Value")]
+pub enum ContextLimit {
+    Auto,
+    Tokens(std::num::NonZeroUsize),
+}
+impl FromStr for ContextLimit {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self> {
+        if s == "auto" {
+            Ok(Self::Auto)
+        } else {
+            s.parse()
+                .map(Self::Tokens)
+                .map_err(|_| "context must be auto or a positive token count".into())
+        }
+    }
+}
+impl fmt::Display for ContextLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::Tokens(n) => write!(f, "{n}"),
+        }
+    }
+}
+impl TryFrom<serde_json::Value> for ContextLimit {
+    type Error = String;
+    fn try_from(v: serde_json::Value) -> Result<Self> {
+        match v {
+            serde_json::Value::String(s) => s.parse(),
+            serde_json::Value::Number(n) => n.to_string().parse(),
+            _ => Err("Invalid context".into()),
+        }
+    }
+}
+impl From<ContextLimit> for serde_json::Value {
+    fn from(v: ContextLimit) -> Self {
+        match v {
+            ContextLimit::Auto => serde_json::json!("auto"),
+            ContextLimit::Tokens(n) => serde_json::json!(n),
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ContextOptions {
+    pub context: Option<ContextLimit>,
+    pub kv_cache_mib: Option<std::num::NonZeroUsize>,
+    pub context_concurrency: Option<std::num::NonZeroUsize>,
+}
+impl ContextOptions {
+    pub fn plans_capacity(self) -> bool {
+        self.kv_cache_mib.is_some()
+            || self.context_concurrency.is_some()
+            || self.context == Some(ContextLimit::Auto)
+    }
+    pub fn kv_bytes(self) -> Result<usize> {
+        self.kv_cache_mib
+            .map_or(0, usize::from)
+            .checked_mul(1 << 20)
+            .ok_or("KV budget overflows byte count".into())
+    }
+}
+#[derive(Clone, Debug, Default)]
+pub struct ContextPlan {
+    pub package: usize,
+    pub effective: usize,
+    pub owners: usize,
+    pub requested_bytes: usize,
+    pub pool_bytes: usize,
+    pub planned_growth_bytes: usize,
+    pub other_worker_bytes: usize,
+    pub(crate) baseline: [usize; 3],
+    pub(crate) growth: [usize; 3],
+    pub(crate) remaining: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub used: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+impl ContextPlan {
+    pub fn remaining_growth_bytes(&self) -> usize {
+        self.remaining.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(crate) fn observe(&self, resident: [usize; 3]) {
+        let remaining = self
+            .growth
+            .iter()
+            .enumerate()
+            .map(|(i, &budget)| budget.saturating_sub(resident[i].saturating_sub(self.baseline[i])))
+            .sum();
+        self.remaining
+            .store(remaining, std::sync::atomic::Ordering::Release);
+    }
+    pub fn report(&self) -> serde_json::Value {
+        serde_json::json!({"package_context":self.package,"effective_context":self.effective,"planning_concurrency":self.owners,"requested_kv_bytes":self.requested_bytes,"pool_bytes":self.pool_bytes,"planned_growth_bytes":self.planned_growth_bytes,"remaining_growth_bytes":self.remaining_growth_bytes(),"other_worker_bytes":self.other_worker_bytes,"used_pool_bytes":self.used.load(std::sync::atomic::Ordering::Relaxed)})
+    }
+}
+
 /// Public request bound; each execution package validates its supported depths.
 pub const MAX_MTP_DRAFTS: usize = 31;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SpecMethod {
+    None,
+    Mtp,
+    PromptLookup,
+    Draft,
+    Dflash,
+    Dflash2,
+    Dspark,
+}
+
+impl SpecMethod {
+    pub fn uses_draft_model(self) -> bool {
+        matches!(
+            self,
+            Self::Draft | Self::Dflash | Self::Dflash2 | Self::Dspark
+        )
+    }
+}
+impl FromStr for SpecMethod {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self> {
+        serde::Deserialize::deserialize(
+            serde::de::value::StrDeserializer::<serde::de::value::Error>::new(value),
+        )
+        .map_err(|e| e.to_string())
+    }
+}
+
+impl std::fmt::Display for SpecMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "none",
+            Self::Mtp => "mtp",
+            Self::Draft => "draft",
+            Self::Dflash => "dflash",
+            Self::Dflash2 => "dflash2",
+            Self::Dspark => "dspark",
+            Self::PromptLookup => "prompt-lookup",
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LoadOptions {
@@ -26,6 +167,7 @@ pub struct LoadOptions {
     /// None keeps the package default; zero disables speculative execution.
     pub mtp_drafts: Option<usize>,
     /// Opt in to target-verified proposals copied from the request history.
+    pub spec_method: Option<SpecMethod>,
     pub prompt_lookup: bool,
 }
 
@@ -104,7 +246,7 @@ impl LoadOptions {
             return Ok(());
         };
         if drafts == 0 {
-            disable_mtp(manifest);
+            prune_mtp(manifest, false);
             return Ok(());
         }
         if drafts > MAX_MTP_DRAFTS {
@@ -126,11 +268,17 @@ impl LoadOptions {
             ));
         }
         spec.default_verification_tokens = rows;
+        if self
+            .spec_method
+            .is_some_and(|m| m.uses_draft_model() || m == SpecMethod::PromptLookup)
+        {
+            prune_mtp(manifest, true);
+        }
         Ok(())
     }
 }
 
-fn disable_mtp(manifest: &mut crate::model::Manifest) {
+fn prune_mtp(manifest: &mut crate::model::Manifest, keep_verifier: bool) {
     use crate::model::Operation;
     use std::collections::BTreeSet;
     let Some(spec) = manifest.mtp.take() else {
@@ -157,18 +305,39 @@ fn disable_mtp(manifest: &mut crate::model::Manifest) {
             .reset_buffers
             .retain(|name| !draft_kv.contains(name));
     }
-    let mut disabled = BTreeSet::from([spec.draft_program]);
-    disabled.extend(spec.batch_programs);
+    let mut disabled = BTreeSet::from([spec.draft_program.clone()]);
+    if keep_verifier {
+        let mut verifier = spec.clone();
+        verifier.warm_plans.clear();
+        verifier.batch_warm = false;
+        verifier.batch_draft_profiles.clear();
+        verifier.draft_snapshot_program = None;
+        verifier.draft_restore_program = None;
+        manifest.mtp = Some(verifier);
+    } else {
+        disabled.extend(spec.batch_programs);
+    }
     disabled.extend(spec.draft_snapshot_program);
     disabled.extend(spec.draft_restore_program);
     for p in spec.warm_plans {
         disabled.extend([p.program, p.head_program]);
     }
-    for p in spec.verification_plans {
-        disabled.extend([p.program, p.restore_program, p.capture_program]);
+    if !keep_verifier {
+        for p in spec.verification_plans {
+            disabled.extend([p.program, p.restore_program, p.capture_program]);
+        }
     }
     // Target capture is also a dependency of architecture-owned batch plans.
     let mut required: BTreeSet<_> = spec.capture_plans.into_iter().map(|p| p.program).collect();
+    if let Some(verifier) = &manifest.mtp {
+        for plan in &verifier.verification_plans {
+            required.extend([
+                plan.program.clone(),
+                plan.restore_program.clone(),
+                plan.capture_program.clone(),
+            ]);
+        }
+    }
     required.extend(["decode".into(), "prefill".into(), "head".into()]);
     for p in &manifest.prefill_plans {
         required.extend([p.prefill_program.clone(), p.head_program.clone()]);
@@ -402,5 +571,24 @@ mod tests {
             assert!(CudaGraphMode::Full.uses_graph(phase));
             assert!(!CudaGraphMode::Off.uses_graph(phase));
         }
+    }
+}
+
+#[cfg(test)]
+mod context_growth_tests {
+    use super::ContextPlan;
+    #[test]
+    fn physical_growth_is_credited_only_to_its_own_planned_component() {
+        let plan = ContextPlan {
+            baseline: [0, 20, 30],
+            growth: [0, 100, 80],
+            ..Default::default()
+        };
+        plan.observe([4096, 80, 300]);
+        assert_eq!(plan.remaining_growth_bytes(), 40);
+        plan.observe([4096, 20, 40]);
+        assert_eq!(plan.remaining_growth_bytes(), 170);
+        plan.observe([0, 0, 0]);
+        assert_eq!(plan.remaining_growth_bytes(), 180);
     }
 }

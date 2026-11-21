@@ -114,7 +114,9 @@ fn programs(manifest: &crate::model::Manifest) -> std::collections::BTreeSet<Str
         programs.extend(vision.plans.iter().map(|p| p.program.clone()));
     }
     if let Some(spec) = &manifest.mtp {
-        programs.insert(spec.draft_program.clone());
+        if !spec.warm_plans.is_empty() {
+            programs.insert(spec.draft_program.clone());
+        }
         programs.extend(spec.draft_snapshot_program.iter().cloned());
         programs.extend(spec.draft_restore_program.iter().cloned());
         for plan in &spec.warm_plans {

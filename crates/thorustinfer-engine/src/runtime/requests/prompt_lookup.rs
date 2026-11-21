@@ -34,6 +34,15 @@ impl PromptLookup {
         if history.len() < KEY || count == 0 {
             return None;
         }
+        self.index_history(history);
+        self.find(history, count, minimum)
+            .map(|end| history[end..end + count].to_vec())
+    }
+
+    pub fn index_history(&mut self, history: &[u32]) {
+        if history.len() < KEY {
+            return;
+        }
         // Only append committed history. Neither rejected drafts nor another
         // request's prefix/cache entries enter the index.
         let first = self.indexed.max(history.len().saturating_sub(WINDOW));
@@ -52,8 +61,6 @@ impl PromptLookup {
             }
         }
         self.indexed = history.len() - KEY + 1;
-        self.find(history, count, minimum)
-            .map(|end| history[end..end + count].to_vec())
     }
 
     pub fn available(&self, history: &[u32], count: usize) -> bool {

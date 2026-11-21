@@ -45,23 +45,56 @@ pub fn run(config: BatchConfig) -> Result<BatchReport> {
         .map_err(|e| format!("Read model identity: {e}"))?;
     // Version the resolved model-default policy as well as explicit overrides.
     // Old journals must not mix prior defaults with newly prepared requests.
-    let identity = json!({"schema":2,"input_sha256":input.sha256,
+    let mut identity = json!({"schema":2,"input_sha256":input.sha256,
         "model_sha256":thorustinfer_engine::artifact::sha256(&descriptor),"model":config.model,
         "default_request_params":defaults,"mtp_drafts":config.load.mtp_drafts,
         "prompt_lookup":config.load.prompt_lookup});
-    let mut journal = Journal::open(&config.output, config.resume, &identity, &input)?;
+    if config.context_options.context.is_some()
+        || config.context_options.kv_cache_mib.is_some()
+        || config.context_options.context_concurrency.is_some()
+    {
+        identity["context_options"] = json!(config.context_options);
+    }
+    if let Some(method) = config.load.spec_method {
+        identity["spec_method"] = json!(method);
+    }
+    if let Some(draft) = &config.draft_model {
+        let manifest =
+            if config.load.spec_method == Some(thorustinfer_engine::execution::SpecMethod::Draft) {
+                "cache/model.json"
+            } else {
+                "draft.json"
+            };
+        let descriptor = std::fs::read(draft.join(manifest)).map_err(|e| e.to_string())?;
+        identity["draft_sha256"] = json!(thorustinfer_engine::artifact::sha256(&descriptor));
+        identity["draft_confidence"] = json!(config.draft_confidence);
+    }
+    // A manual limit is already identified by context_options. Only a
+    // memory-derived limit needs a live worker to establish journal identity.
+    let dynamic = settings.context_options.plans_capacity()
+        && !matches!(
+            settings.context_options.context,
+            Some(thorustinfer_engine::execution::ContextLimit::Tokens(_))
+        );
+    let mut journal = if dynamic {
+        None
+    } else {
+        Some(Journal::open(
+            &config.output,
+            config.resume,
+            &identity,
+            &input,
+        )?)
+    };
+    let skipped = |j: &Journal| j.states.values().filter(|s| **s != Outcome::Failed).count();
     let mut report = BatchReport {
         scheduler_policy: config.scheduler.policy,
         batch_order: config.order,
         total: input.ids.len(),
-        skipped: journal
-            .states
-            .values()
-            .filter(|s| **s != Outcome::Failed)
-            .count(),
+        skipped: journal.as_ref().map_or(0, skipped),
         ..Default::default()
     };
-    if report.skipped < report.total {
+    if dynamic || report.skipped < report.total {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -70,6 +103,15 @@ pub fn run(config: BatchConfig) -> Result<BatchReport> {
         let result = runtime.block_on(async {
             let worker = startup::start(&settings).await?;
             let result = async {
+                if dynamic {
+                    identity["effective_context"] = json!(worker.state.context);
+                    let opened = Journal::open(&config.output, config.resume, &identity, &input)?;
+                    report.skipped = skipped(&opened);
+                    journal = Some(opened);
+                }
+                if report.skipped == report.total {
+                    return Ok(());
+                }
                 if config.order == BatchOrder::Auto
                     && config.scheduler.policy == thorustinfer_engine::scheduler::Policy::Throughput
                 {
@@ -81,7 +123,7 @@ pub fn run(config: BatchConfig) -> Result<BatchReport> {
                 }
                 execute(
                     &mut input,
-                    &mut journal,
+                    journal.as_mut().expect("batch identity established"),
                     worker.state.clone(),
                     &defaults,
                     &mut report,
@@ -93,9 +135,10 @@ pub fn run(config: BatchConfig) -> Result<BatchReport> {
             result.and(stopped)
         });
         runtime.shutdown_timeout(std::time::Duration::from_secs(2));
-        let synced = journal.sync();
+        let synced = journal.as_mut().map_or(Ok(()), Journal::sync);
         result.and(synced)?;
     }
+    let journal = journal.ok_or("Batch journal was not opened")?;
     for status in journal.states.values() {
         match status {
             Outcome::Success => report.succeeded += 1,

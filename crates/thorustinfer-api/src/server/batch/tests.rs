@@ -212,3 +212,25 @@ async fn queued_results_are_drained_before_resume() {
     let journal = reopen_after_close(&path, &identity, &input);
     assert_eq!(journal.states.len(), 3);
 }
+
+#[test]
+fn resume_checks_effective_auto_limit_before_repairing_journal() {
+    let d = Directory::new();
+    let input = d.input("{\"messages\":[]}\n");
+    let options = json!({"schema":2,"context_options":{"context":"auto"}});
+    let mut current = options.clone();
+    current["effective_context"] = json!(4096);
+    let mut larger = options.clone();
+    larger["effective_context"] = json!(8192);
+    for (name, stored, expected) in [
+        ("changed", larger, "journal 8192, worker 4096"),
+        ("legacy", options, "journal unspecified, worker 4096"),
+    ] {
+        let path = d.0.join(name);
+        fs::write(&path, b"partial").unwrap();
+        fs::write(path.with_extension("meta.json"), stored.to_string()).unwrap();
+        let error = Journal::open(&path, true, &current, &input).err().unwrap();
+        assert!(error.contains(expected), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), b"partial");
+    }
+}

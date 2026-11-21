@@ -64,6 +64,24 @@ struct InferenceArgs {
     /// auto adapts up to the package default; 0 disables MTP; 1..31 caps drafts within package capacity.
     #[arg(long, value_name = "N", default_value = "auto")]
     mtp_drafts: MtpDrafts,
+    /// Select ordinary decoding, native MTP, or greedy prompt lookup.
+    #[arg(long, conflicts_with_all = ["mtp_drafts", "prompt_lookup"])]
+    spec_method: Option<thorustinfer_engine::execution::SpecMethod>,
+    /// Prepared small model for independent greedy draft proposals.
+    #[arg(long, requires = "spec_method")]
+    draft_model: Option<PathBuf>,
+    /// Shorten DSpark proposals using its trained confidence head.
+    #[arg(long, requires = "draft_model")]
+    draft_confidence: Option<f32>,
+    /// Single-request input plus output limit, or auto to plan after loading the model.
+    #[arg(long)]
+    context: Option<thorustinfer_engine::execution::ContextLimit>,
+    /// Preallocate a physical pool for request KV pages (MiB).
+    #[arg(long)]
+    kv_cache_mib: Option<std::num::NonZeroUsize>,
+    /// Number of simultaneous maximum-length requests for context planning.
+    #[arg(long)]
+    context_concurrency: Option<std::num::NonZeroUsize>,
     /// Device prefix-cache budget per device in MiB; 0 disables the device tier.
     #[arg(long = "prefix-cache-mib", value_name = "MIB", default_value_t = ServerConfig::default().prefix_cache_bytes >> 20, value_parser = parse_cache_mib)]
     prefix_cache_bytes: usize,
@@ -145,6 +163,13 @@ impl From<InferenceArgs> for ServerConfig {
     fn from(args: InferenceArgs) -> Self {
         let load = args.load.options();
         Self {
+            context_options: thorustinfer_engine::execution::ContextOptions {
+                context: args.context,
+                kv_cache_mib: args.kv_cache_mib,
+                context_concurrency: args.context_concurrency,
+            },
+            draft_confidence: args.draft_confidence,
+            draft_model: args.draft_model,
             model: args.model,
             default_request_params: args.default_request_params.unwrap_or_default(),
             gpu_lock: args.gpu_lock,
@@ -153,6 +178,7 @@ impl From<InferenceArgs> for ServerConfig {
             load_workers: load.load_workers,
             resident_experts: load.resident_experts,
             mtp_drafts: args.mtp_drafts.0,
+            spec_method: args.spec_method,
             prompt_lookup: load.prompt_lookup,
             prefix_cache_bytes: args.prefix_cache_bytes,
             kv_offload_bytes: args.kv_offload_bytes,
@@ -200,6 +226,9 @@ impl From<BatchArgs> for BatchConfig {
             output: args.output,
             resume: args.resume,
             order: args.batch_order,
+            context_options: config.context_options,
+            draft_confidence: config.draft_confidence,
+            draft_model: config.draft_model,
             model_dir: args.model_dir,
             model: config.model,
             gpu_lock: config.gpu_lock,
@@ -212,6 +241,7 @@ impl From<BatchArgs> for BatchConfig {
                 load_workers: config.load_workers,
                 resident_experts: config.resident_experts,
                 mtp_drafts: config.mtp_drafts,
+                spec_method: config.spec_method,
                 prompt_lookup: config.prompt_lookup,
                 prefix_cache_bytes: config.prefix_cache_bytes,
                 kv_offload_bytes: config.kv_offload_bytes,

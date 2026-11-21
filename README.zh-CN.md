@@ -11,8 +11,8 @@ Thorustinfer 在 Jetson Thor 上运行本地模型。同一个 HTTP 地址提供
 在装有兼容 NVIDIA 驱动的 Jetson Thor（Linux aarch64）上解压运行包，执行安装脚本。安装和运行都不需要 Python，也不用创建 conda 环境。`info` 显示引擎信息，`devices` 列出可用的 GPU。
 
 ```bash
-tar -xJf thorustinfer-0.2.1-linux-aarch64.tar.xz
-bash thorustinfer-0.2.1-linux-aarch64/install.sh
+tar -xJf thorustinfer-0.2.2-linux-aarch64.tar.xz
+bash thorustinfer-0.2.2-linux-aarch64/install.sh
 CLI="$HOME/.local/opt/thorustinfer/bin/thorustinfer"
 "$CLI" info
 "$CLI" devices --backend cuda
@@ -96,3 +96,39 @@ Qwen3.5-4B 在 T5000 上测过两档：`e8p` 使用 E8P Q4A8，`w4a4` 使用原�
 [服务与客户端](docs/serving.md) · [模型包格式](docs/model-packages.md) · [从源码构建](tools/thor/BUILD.md) · [OpenCode 示例](examples/opencode.json) · [Pi 示例](examples/pi-models.json)
 
 [独立 Agent 基准](https://github.com/massif-01/Thorustinfer-benchmarks) · [DeepSeek 模型参考](reference/deepseek-v41/README.md)
+
+## Worker 上下文和 KV 内存
+
+`--context N` 限制单请求的输入与输出 token 总数。使用 `--context auto`，worker 在权重加载后根据实际可用内存计算上限。省略以下三个选项时沿用执行包上限，按需映射 KV 页。
+
+| 选项 | 用途 |
+| --- | --- |
+| `--kv-cache-mib B` | 预留 B MiB 物理页，供设备端请求 KV 和共享前缀使用。实际大小按 CUDA 页粒度向下对齐。只给 B 时自动计算上下文。 |
+| `--context N\|auto` | 指定单请求上限，或计算执行包、物理内存和 KV 预算能容纳的最大长度。显式设置无法兑现时在启动阶段报错。 |
+| `--context-concurrency C` | 为 C 个同时达到上限的请求规划容量，默认 1，最高为 `--max-active-requests`。短请求仍可利用剩余容量。 |
+
+独立服务、注册模型的管理模式和离线 batch 使用相同参数。管理器会让需要规划容量的 worker 与其他 worker 错开启动。HTTP 和 batch worker 按生效配置发布上下文上限与增长预算。`remaining_growth_bytes` 随实际映射和释放更新，管理器按尚未兑现的部分计费。自动规划的 batch 续跑需要本次有效 token 上限与上次一致。在 worker 的 `/health` 中读取 `context_plan`，可查看包上限、生效上限、规划并发、请求池字节数、对齐后的实际池字节数和当前占用。`--prefix-cache-mib` 控制快照保留容量，`--memory-reserve-mib` 控制系统预留内存。
+
+## 推测解码
+
+带验证器的 W4A4 执行包支持原生 MTP、greedy Prompt Lookup 和独立草稿。原版 W4A4 包继续支持普通解码。W4A4 默认普通解码，已有 E8P 安装沿用执行包默认值。
+
+| `--spec-method` | 候选来源 |
+| --- | --- |
+| `none` | 主模型普通解码。 |
+| `mtp` | 执行包自带的 MTP 头，支持 greedy 和拒绝采样。 |
+| `prompt-lookup` | 从本请求已提交的历史中复制重复片段，未命中时走普通解码。 |
+| `draft` | 独立的小模型，要求分词规则、token ID 和特殊 token 一致。 |
+| `dflash`、`dflash2`、`dspark` | 使用与目标 revision 配对的草稿包，从声明的主模型中间层读取特征。DFlash2 使用已训练的动态卷积和候选选择器，DSpark 使用 Markov 头，可启用置信度头。 |
+
+用已安装的目标模型和小模型目录启动文本草稿模式。
+
+```sh
+thorustinfer serve "$TARGET_MODEL" --spec-method draft --draft-model "$SMALL_MODEL"
+```
+
+三种块草稿沿用 `--draft-model`。使用 DSpark 时可加 `--draft-confidence P`，P 取 0 到 1，训练得到的置信度低于 P 时缩短候选。省略时在验证器支持的宽度内使用固定长度。在 CUDA 构建环境运行 `python -m thorustinfer_build.models.block_draft.build --source CHECKPOINT --target-model TARGET --output PACKAGE --cache BUILD_CACHE` 可从本地 checkpoint 生成草稿包。
+
+Prompt Lookup 和独立草稿方法适用于单个纯文本请求的无惩罚 greedy 采样。将 `temperature`、`presence_penalty`、`frequency_penalty` 设为 0，`repetition_penalty` 设为 1。其他采样设置由主模型普通解码。独立小模型和块草稿在多个请求同时活跃或需要 token 掩码时也走普通解码。流式接口只发送已经验证的 token。命中主模型前缀时，从真实已提交历史补齐所需草稿状态。worker 在启动时读取本地草稿目录。
+
+显式选择 `--spec-method` 时独立使用该参数；原有 `--mtp-drafts` 和 `--prompt-lookup` 组合继续可用。旧的 lookup 开关允许未命中时由 MTP 提供候选。worker 的 `/health` 报告所选方法和验证宽度，请求结束日志包含候选数、接受数和验证耗时。

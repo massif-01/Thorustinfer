@@ -54,7 +54,9 @@ struct Service {
     codec: Arc<ChatCodec>,
     model: Arc<str>,
     context: usize,
+    context_plan: thorustinfer_engine::execution::ContextPlan,
     mtp_drafts: usize,
+    spec_method: Option<thorustinfer_engine::execution::SpecMethod>,
     prompt_lookup: bool,
     verify_weights: bool,
     resident_experts: thorustinfer_engine::execution::ResidentExperts,
@@ -308,7 +310,7 @@ async fn health(State(state): State<Service>) -> Response {
         Err(message) => return error(StatusCode::INTERNAL_SERVER_ERROR, message),
     };
     (if state.activity.lifecycle.is_ready() { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE }, Json(
-        json!({"service":"thorustinfer","version":env!("CARGO_PKG_VERSION"),"status":state.activity.lifecycle.name(),"failure":state.activity.lifecycle.failure(),"model":state.model.as_ref(),"max_context":state.context,
+        json!({"service":"thorustinfer","version":env!("CARGO_PKG_VERSION"),"status":state.activity.lifecycle.name(),"failure":state.activity.lifecycle.failure(),"model":state.model.as_ref(),"max_context":state.context,"context_plan":state.context_plan.report(),
         "frontend_assets":state.codec.asset_hashes,
         "verify_weights":state.verify_weights,
         "resident_experts":state.resident_experts,
@@ -323,7 +325,8 @@ async fn health(State(state): State<Service>) -> Response {
             "logprobs":true,"max_top_logprobs":20,"logit_bias":true,"stored_completions":false,
             "images":state.vision.is_some(),"video":false,"audio":state.codec.audio.is_some(),"default_max_completion_tokens":output_limit,
             "thinking_token_budget":true,"chat_template_kwargs":true,"prompt_cache":{"key":true,"retention":["in-memory","24h"],"persistent":false,"ttl_guaranteed":false}},
-        "mtp":{"enabled":state.mtp_drafts>0,"max_drafts":state.mtp_drafts},
+        "speculation":{"method":state.spec_method.map_or_else(||if state.mtp_drafts==0 {"none".into()}else if state.prompt_lookup {"mtp+prompt-lookup".into()}else{"mtp".into()},|m|m.to_string()),"max_drafts":state.mtp_drafts},
+        "mtp":{"enabled":state.mtp_drafts>0 && state.spec_method.is_none_or(|m|m==thorustinfer_engine::execution::SpecMethod::Mtp),"max_drafts":state.mtp_drafts},
         "prompt_lookup":{"enabled":state.prompt_lookup && state.mtp_drafts>0},
         "continuous_batching":true,"scheduler":state.scheduler,
         "scheduler_statistics":state.activity.statistics.lock().ok().map(|s| s.clone()),

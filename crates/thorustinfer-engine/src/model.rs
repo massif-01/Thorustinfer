@@ -238,6 +238,32 @@ pub(crate) fn read<T: serde::de::DeserializeOwned>(p: &Path) -> Result<T> {
         .map_err(|e| format!("{}: {e}", p.display()))
 }
 
+fn check_draft_tokenizer(target: &std::path::Path, draft: &std::path::Path) -> Result<()> {
+    fn semantics(path: &std::path::Path) -> Result<(serde_json::Value, Vec<serde_json::Value>)> {
+        let tok = tokenizers::Tokenizer::from_file(path.join("tokenizer.json"))
+            .map_err(|e| e.to_string())?;
+        let tokenizer = serde_json::to_value(tok).map_err(|e| e.to_string())?;
+        let config: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(path.join("generation_config.json")).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok((
+            tokenizer,
+            ["eos_token_id", "bos_token_id", "pad_token_id"]
+                .iter()
+                .map(|&k| config[k].clone())
+                .collect(),
+        ))
+    }
+    if semantics(target)? != semantics(draft)? {
+        return Err(
+            "Draft tokenizer ID mapping, special tokens, or tokenization rules differ from target"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Thread-affine resident model. All CUDA resources remain on the creating thread.
 pub struct Model(crate::runtime::ModelRuntime);
 pub(crate) mod request;
@@ -366,10 +392,72 @@ impl Model {
         Self::load_with_options(path, LoadOptions::default())
     }
     pub fn load_with_options(path: &Path, options: LoadOptions) -> Result<Self> {
-        crate::runtime::ModelRuntime::load_with_options(path, options).map(Self)
+        Self::load_with_draft(path, options, None, None)
+    }
+    pub fn load_with_draft(
+        path: &Path,
+        options: LoadOptions,
+        draft: Option<&Path>,
+        confidence: Option<f32>,
+    ) -> Result<Self> {
+        if options.spec_method.is_some_and(|m| m.uses_draft_model()) != draft.is_some() {
+            return Err("The selected proposal method and draft model must match".into());
+        }
+        if options.spec_method == Some(crate::execution::SpecMethod::Draft)
+            && let Some(draft) = draft
+        {
+            check_draft_tokenizer(path, draft)?;
+        }
+        let mut model = Self(crate::runtime::ModelRuntime::load_with_options(
+            path, options,
+        )?);
+        if let Some(draft) = draft {
+            model.attach_draft(draft, options, confidence)?;
+        }
+        Ok(model)
+    }
+    fn attach_draft(
+        &mut self,
+        path: &Path,
+        options: LoadOptions,
+        confidence: Option<f32>,
+    ) -> Result<()> {
+        if let Some(method) = options.spec_method
+            && method != crate::execution::SpecMethod::Draft
+        {
+            return self
+                .0
+                .attach_block(path, method, confidence, options.verify_weights);
+        }
+        let draft = crate::runtime::ModelRuntime::load_with_options(
+            path,
+            LoadOptions {
+                spec_method: Some(crate::execution::SpecMethod::None),
+                prefix_cache_bytes: 0,
+                kv_offload_bytes: 0,
+                ..options
+            },
+        )?;
+        self.0.attach_draft(draft)
+    }
+    pub fn refresh_context_growth(
+        &self,
+        plan: &crate::execution::ContextPlan,
+        feature_bytes: usize,
+    ) {
+        if plan.planned_growth_bytes != 0 {
+            plan.observe(self.0.context_resident(feature_bytes));
+        }
+    }
+    pub fn configure_context(
+        &mut self,
+        options: crate::execution::ContextOptions,
+        scheduler: &crate::scheduler::Options,
+    ) -> Result<crate::execution::ContextPlan> {
+        self.0.configure_context(options, scheduler)
     }
     pub fn max_context(&self) -> usize {
-        self.0.manifest.max_context
+        self.0.effective_context
     }
     pub fn mtp_drafts(&self) -> usize {
         self.0
@@ -582,5 +670,44 @@ mod tests {
         assert!(m.validate().is_err());
         m.prefill_plans[1].prefill_program = "decode".into();
         assert!(m.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod draft_identity_tests {
+    use super::*;
+    #[test]
+    fn public_loader_verifies_draft_ids_before_model_or_cuda_load() {
+        let target = tempfile::tempdir().unwrap();
+        let draft = tempfile::tempdir().unwrap();
+        let write = |dir: &Path, tokens: [&str; 2], eos: u32| {
+            let mut tok = tokenizers::Tokenizer::new(tokenizers::models::bpe::BPE::default());
+            tok.add_special_tokens(
+                tokens
+                    .map(|s| tokenizers::AddedToken::from(s, true))
+                    .to_vec(),
+            )
+            .unwrap();
+            tok.save(dir.join("tokenizer.json"), false).unwrap();
+            fs::write(
+                dir.join("generation_config.json"),
+                format!("{{\"eos_token_id\":{eos}}}"),
+            )
+            .unwrap();
+        };
+        write(target.path(), ["<a>", "<b>"], 0);
+        let options = LoadOptions {
+            spec_method: Some(crate::execution::SpecMethod::Draft),
+            ..Default::default()
+        };
+        for (tokens, eos) in [(["<b>", "<a>"], 0), (["<a>", "<b>"], 1)] {
+            write(draft.path(), tokens, eos);
+            let error = Model::load_with_draft(target.path(), options, Some(draft.path()), None)
+                .err()
+                .unwrap();
+            assert!(error.contains("Draft tokenizer ID mapping"), "{error}");
+        }
+        write(draft.path(), ["<a>", "<b>"], 0);
+        check_draft_tokenizer(target.path(), draft.path()).unwrap();
     }
 }

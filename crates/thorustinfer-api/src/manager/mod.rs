@@ -35,6 +35,10 @@ struct Runner {
     child: Mutex<Child>,
     client: reqwest::Client,
     active: AtomicUsize,
+    effective_context: AtomicUsize,
+    plans_capacity: bool,
+    load_bytes: usize,
+    capacity_file: PathBuf,
     last_used: SyncMutex<Instant>,
     keep_alive_s: AtomicU64,
     draining: AtomicBool,
@@ -47,6 +51,29 @@ struct Runner {
 struct BudgetTotals {
     requests: usize,
     loading: usize,
+    request_by_owner: BTreeMap<String, usize>,
+    plans: BTreeMap<String, PathBuf>,
+}
+impl BudgetTotals {
+    /// A ticket for an active request and its worker plan cover the same
+    /// future bytes. Physical growth is already reflected in MemAvailable.
+    fn charged(&self, new_request: Option<(&str, usize)>) -> Result<usize> {
+        let extra = new_request.map_or(0, |(_, n)| n);
+        let mut bytes = (self.requests as u128) + (extra as u128) + (self.loading as u128);
+        for (key, file) in &self.plans {
+            let plan = crate::capacity::read(file)?.ok_or("Missing live worker capacity")?;
+            let tickets = self.request_by_owner.get(key).copied().unwrap_or(0) as u128
+                + new_request
+                    .filter(|(k, _)| *k == key)
+                    .map_or(0, |(_, n)| n as u128);
+            let materialized = plan.planned.saturating_sub(plan.remaining) as u128;
+            bytes = bytes - tickets
+                + tickets
+                    .max(plan.planned as u128)
+                    .saturating_sub(materialized);
+        }
+        usize::try_from(bytes).map_err(|_| "Global memory budget overflow".into())
+    }
 }
 #[derive(Clone, Copy)]
 enum BudgetKind {
@@ -56,11 +83,34 @@ enum BudgetKind {
 struct MemoryBudget {
     bytes: usize,
     kind: BudgetKind,
+    owner: Option<String>,
+    prior: usize,
     total: Arc<SyncMutex<BudgetTotals>>,
+}
+impl MemoryBudget {
+    fn publish(&mut self, runner: &Runner) {
+        let mut total = self.total.lock().unwrap_or_else(|e| e.into_inner());
+        total.loading -= self.bytes;
+        self.bytes = 0;
+        if runner.plans_capacity {
+            total
+                .plans
+                .insert(runner.key.clone(), runner.capacity_file.clone());
+        }
+        runner.loading.store(false, Ordering::Release);
+    }
 }
 impl Drop for MemoryBudget {
     fn drop(&mut self) {
         let mut total = self.total.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(key) = &self.owner
+            && let Some(count) = total.request_by_owner.get_mut(key)
+        {
+            *count -= self.bytes;
+            if *count == 0 {
+                total.request_by_owner.remove(key);
+            }
+        }
         let used = match self.kind {
             BudgetKind::Request => &mut total.requests,
             BudgetKind::Loading => &mut total.loading,
@@ -191,13 +241,15 @@ impl Manager {
                 // may load concurrently against separately reserved budgets.
                 let result = match result {
                     Ok(Acquisition::Ready(lease, record)) => Ok((lease, record)),
-                    Ok(Acquisition::Loading(lease, record, budget)) => {
+                    Ok(Acquisition::Loading(lease, record, mut budget)) => {
                         let result = manager.finish_start(&lease.0).await;
-                        drop(budget);
-                        if result.is_ok() {
-                            lease.0.loading.store(false, Ordering::Release);
+                        match result {
+                            Ok(()) => manager
+                                .publish_ready(&lease.0, &mut budget)
+                                .await
+                                .map(|()| (lease, record)),
+                            Err(e) => Err(e),
                         }
-                        result.map(|()| (lease, record))
                     }
                     Err(error) => Err(error),
                 };
@@ -276,7 +328,10 @@ impl Manager {
         let key = runner_key(&record);
         // Only an exited worker can remain after the ready check. Startup and
         // sweep also hold transition, so no replacement can be removed here.
-        self.runners.lock().await.remove(&key);
+        let exited = self.runners.lock().await.get(&key).cloned();
+        if let Some(runner) = exited {
+            self.remove_runner(&runner).await?;
+        }
         if let Some((at, message)) = self.failures.lock().await.get(&key)
             && at.elapsed() < Duration::from_secs(10)
         {
@@ -306,17 +361,49 @@ impl Manager {
         }
     }
 
-    async fn start(&self, record: &ModelRecord, key: &str) -> Result<(Arc<Runner>, MemoryBudget)> {
-        let actual = thorustinfer_engine::artifact::sha256(
-            &fs::read(record.path.join("cache/model.json")).map_err(|e| e.to_string())?,
+    async fn prepare_worker(
+        &self,
+        record: &ModelRecord,
+        key: &str,
+    ) -> Result<(MemoryBudget, PathBuf, Command)> {
+        self.reserve_space(record).await?;
+        let budget = self.reserve_budget(record.start_bytes()?, BudgetKind::Loading, None)?;
+        let directory = self.directory.join(&key[..16]);
+        private_directory(&directory)?;
+        // The lifecycle permit owns this directory until the new child is registered.
+        match fs::remove_file(crate::capacity::path(&directory)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        let mut command = self.command();
+        command.env(crate::capacity::DIRECTORY, &directory).env(
+            "THORUSTINFER_WORKER_PLANNING_BYTES",
+            budget.prior.to_string(),
         );
+        Ok((budget, directory, command))
+    }
+    async fn publish_ready(&self, runner: &Arc<Runner>, budget: &mut MemoryBudget) -> Result<()> {
+        let runners = self.runners.lock().await;
+        if !runners
+            .get(&runner.key)
+            .is_some_and(|r| Arc::ptr_eq(r, runner))
+            || runner.draining.load(Ordering::Acquire)
+        {
+            return Err("Model is draining".into());
+        }
+        budget.publish(runner);
+        Ok(())
+    }
+    async fn start(&self, record: &ModelRecord, key: &str) -> Result<(Arc<Runner>, MemoryBudget)> {
+        let actual = registry::model_identity(
+            &fs::read(record.path.join("cache/model.json")).map_err(|e| e.to_string())?,
+            &record.options,
+        )?;
         if actual != record.identity {
             return Err("Model identity changed; import the new version before loading".into());
         }
-        self.reserve_space(record).await?;
-        let budget = self.reserve_budget(record.load_bytes, BudgetKind::Loading)?;
-        let directory = self.directory.join(&key[..16]);
-        private_directory(&directory)?;
+        let (budget, directory, mut command) = self.prepare_worker(record, key).await?;
         let socket = directory.join("thorustinfer-worker.sock");
         if socket.exists() {
             fs::remove_file(&socket).map_err(|e| e.to_string())?;
@@ -329,7 +416,6 @@ impl Manager {
         let mut options = record.options.clone();
         // Alias-specific sampling defaults are applied by the gateway.
         options.default_request_params.clear();
-        let mut command = self.command();
         command
             .arg("worker")
             .arg(&record.path)
@@ -358,6 +444,10 @@ impl Manager {
                 child: Mutex::new(child),
                 client,
                 active: AtomicUsize::new(0),
+                effective_context: AtomicUsize::new(record.max_context),
+                plans_capacity: record.options.context_options.plans_capacity(),
+                load_bytes: record.start_bytes()?,
+                capacity_file: crate::capacity::path(&directory),
                 last_used: SyncMutex::new(Instant::now()),
                 batch: false,
                 keep_alive_s: AtomicU64::new(self.config.keep_alive_s),
@@ -415,6 +505,12 @@ impl Manager {
                 && health["status"] == "ready"
                 && health["model"] == runner.model
             {
+                if let Some(ctx) = health["max_context"]
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                {
+                    runner.effective_context.store(ctx, Ordering::Release);
+                }
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -435,32 +531,63 @@ impl Manager {
             .ok_or("Memory reserve overflow")?;
         Ok(available_bytes()?.saturating_sub(reserve))
     }
-    fn reserve_budget(&self, bytes: usize, kind: BudgetKind) -> Result<MemoryBudget> {
+    fn reserve_budget(
+        &self,
+        bytes: usize,
+        kind: BudgetKind,
+        owner: Option<String>,
+    ) -> Result<MemoryBudget> {
         let mut total = self.budgets.lock().unwrap_or_else(|e| e.into_inner());
         // Keep pending loads fully reserved until ready, even while their
         // partial allocations already appear in MemAvailable. This errs on
         // the conservative side during overlapping CUDA startup.
-        let proposed = total
-            .requests
-            .checked_add(total.loading)
-            .and_then(|n| n.checked_add(bytes))
-            .ok_or("Global memory budget overflow")?;
+        let (proposed, prior) = match owner.as_deref() {
+            Some(key) => (total.charged(Some((key, bytes)))?, 0),
+            None => {
+                let prior = total.charged(None)?;
+                (
+                    prior
+                        .checked_add(bytes)
+                        .ok_or("Global memory budget overflow")?,
+                    prior,
+                )
+            }
+        };
         if self.memory_headroom()? < proposed {
             return Err("Insufficient unified memory for allocation budget".into());
         }
         match kind {
-            BudgetKind::Request => total.requests += bytes,
+            BudgetKind::Request => {
+                total.requests = total
+                    .requests
+                    .checked_add(bytes)
+                    .ok_or("Request budget overflow")?;
+                *total
+                    .request_by_owner
+                    .entry(owner.clone().expect("request owner"))
+                    .or_default() += bytes;
+            }
             BudgetKind::Loading => total.loading += bytes,
         }
         Ok(MemoryBudget {
             bytes,
             kind,
+            owner,
+            prior,
             total: Arc::clone(&self.budgets),
         })
     }
     async fn reserve_space(&self, record: &ModelRecord) -> Result<()> {
         loop {
             let runners: Vec<_> = self.runners.lock().await.values().cloned().collect();
+            // A dynamically sized worker publishes its growth reservation at readiness.
+            // Default workers may still overlap startup with one another.
+            if runners.iter().any(|r| {
+                r.loading.load(Ordering::Acquire)
+                    && (r.plans_capacity || record.options.context_options.plans_capacity())
+            }) {
+                return Err("Model is loading".into());
+            }
             let count_full = self
                 .config
                 .max_loaded_models
@@ -469,10 +596,8 @@ impl Manager {
                 // Both request state and overlapping loads reserve against one
                 // ledger. A final atomic reservation in start() rechecks races.
                 let total = self.budgets.lock().unwrap_or_else(|e| e.into_inner());
-                self.memory_headroom()?
-                    .saturating_sub(total.requests)
-                    .saturating_sub(total.loading)
-                    >= record.load_bytes
+                self.memory_headroom()?.saturating_sub(total.charged(None)?)
+                    >= record.start_bytes()?
             };
             if !count_full && fits {
                 break;
@@ -551,12 +676,16 @@ impl Manager {
         let tokens = input_bytes
             .saturating_add(usize::try_from(output).unwrap_or(usize::MAX))
             .min(record.max_context);
-        let bytes = record
-            .kv_bytes_per_token
+        let kv_stride = if record.options.context_options.kv_cache_mib.is_some() {
+            0
+        } else {
+            record.kv_bytes_per_token
+        };
+        let bytes = kv_stride
             .checked_mul(tokens)
             .and_then(|n| n.checked_add(record.sequence_bytes))
             .ok_or("Request memory estimate overflow")?;
-        self.reserve_budget(bytes, BudgetKind::Request)
+        self.reserve_budget(bytes, BudgetKind::Request, Some(runner_key(record)))
     }
     fn command(&self) -> Command {
         let mut command = Command::new(&self.executable);
@@ -606,6 +735,12 @@ impl Manager {
             .is_some_and(|current| Arc::ptr_eq(current, runner))
         {
             runners.remove(&runner.key);
+            self.budgets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .plans
+                .remove(&runner.key);
+            let _ = fs::remove_file(&runner.capacity_file);
             let _ = fs::remove_file(runner.directory.join("thorustinfer-worker.sock"));
         }
         drop(runners);
@@ -716,13 +851,34 @@ impl Manager {
         }
     }
     async fn status(&self) -> Value {
-        let runners: Vec<_> = self.runners.lock().await.values().cloned().collect();
-        let records = self.records.lock().await;
-        json!(runners.iter().map(|r| json!({"model":r.model,"pid":r.pid,"active_requests":r.active.load(Ordering::Acquire),
-            "state":if r.draining.load(Ordering::Acquire) {"draining"} else if r.loading.load(Ordering::Acquire) {"loading"} else if r.batch {"batch"} else {"ready"},
-            "estimated_load_bytes":records.values().find(|record| runner_key(record)==r.key).map(|record| record.load_bytes),
-            "idle_s":r.last_used.lock().unwrap_or_else(|e| e.into_inner()).elapsed().as_secs_f64(),
-            "keep_alive_s":r.keep_alive_s.load(Ordering::Relaxed),"log":r.directory.join("worker.log")})).collect::<Vec<_>>())
+        let runners = self.runners.lock().await;
+        let mut rows = Vec::with_capacity(runners.len());
+        for runner in runners.values() {
+            let capacity = crate::capacity::read(&runner.capacity_file).ok().flatten();
+            let state = if runner.draining.load(Ordering::Acquire) {
+                "draining"
+            } else if runner.loading.load(Ordering::Acquire) {
+                "loading"
+            } else if runner.batch {
+                "batch"
+            } else {
+                "ready"
+            };
+            rows.push(json!({
+                "model": runner.model,
+                "pid": runner.pid,
+                "active_requests": runner.active.load(Ordering::Acquire),
+                "state": state,
+                "effective_context": runner.effective_context.load(Ordering::Acquire),
+                "planned_growth_bytes": capacity.map_or(0, |p| p.planned),
+                "remaining_growth_bytes": capacity.map_or(0, |p| p.remaining),
+                "estimated_load_bytes": runner.load_bytes,
+                "idle_s": runner.last_used.lock().unwrap_or_else(|e| e.into_inner()).elapsed().as_secs_f64(),
+                "keep_alive_s": runner.keep_alive_s.load(Ordering::Relaxed),
+                "log": runner.directory.join("worker.log"),
+            }));
+        }
+        Value::Array(rows)
     }
 }
 

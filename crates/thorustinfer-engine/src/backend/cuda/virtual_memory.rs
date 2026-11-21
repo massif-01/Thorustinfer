@@ -5,10 +5,87 @@ use std::{collections::BTreeMap, rc::Rc};
 
 use sys::{CUmemAccessDesc as AccessDesc, CUmemAllocationProp as AllocationProp};
 
+/// The worker owns each physical handle exactly once. Reservations borrow
+/// individual pages, including while a published page has virtual aliases.
+pub(crate) struct PagePool {
+    granularity: usize,
+    free: std::cell::RefCell<Vec<u64>>,
+    pub(crate) used: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+impl PagePool {
+    pub(crate) fn create(device: i32, granularity: usize, bytes: usize) -> Result<Rc<Self>> {
+        let capacity = bytes / granularity * granularity;
+        if capacity == 0 {
+            return Err(format!(
+                "KV budget {bytes} is below page size {granularity}"
+            ));
+        }
+        let mut pool = Self {
+            granularity,
+            free: Default::default(),
+            used: Default::default(),
+        };
+        for _ in 0..capacity / granularity {
+            pool.free
+                .get_mut()
+                .push(create_handle(device, granularity)?);
+        }
+        Ok(Rc::new(pool))
+    }
+    fn take(&self, bytes: usize) -> Result<u64> {
+        if bytes != self.granularity {
+            return Err("Non-page-sized KV allocation".into());
+        }
+        let handle = self
+            .free
+            .borrow_mut()
+            .pop()
+            .ok_or("Physical KV pool exhausted")?;
+        self.used
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        Ok(handle)
+    }
+    fn put(&self, handle: u64) {
+        self.free.borrow_mut().push(handle);
+        self.used
+            .fetch_sub(self.granularity, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(crate) fn free_bytes(&self) -> usize {
+        self.free.borrow().len() * self.granularity
+    }
+    pub(crate) fn clear(&self) {
+        for h in self.free.borrow_mut().drain(..) {
+            // SAFETY: Only unmapped pages returned to the free list are released.
+            let result = unsafe { sys::cuMemRelease(h) };
+            if result != sys::CUresult::CUDA_SUCCESS {
+                eprintln!("KV pool release: {result:?}");
+            }
+        }
+    }
+}
+impl Drop for PagePool {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+fn create_handle(device: i32, bytes: usize) -> Result<u64> {
+    let mut handle = 0;
+    // SAFETY: A current context owns this device and the output is writable.
+    unsafe {
+        check(
+            sys::cuMemCreate(&mut handle, bytes, &properties(device), 0),
+            "create KV physical allocation",
+        )?;
+    }
+    Ok(handle)
+}
+
 pub(crate) struct Reservation {
     pub address: u64,
     pub stride: usize,
     region: kv::Reservation,
+    pub(super) pool: Option<Rc<PagePool>>,
 }
 impl std::ops::Deref for Reservation {
     type Target = kv::Reservation;
@@ -24,6 +101,7 @@ impl Reservation {
             offset,
             &Ops {
                 session: s,
+                pool: self.pool.as_ref(),
                 address: self.address,
             },
         )
@@ -75,6 +153,7 @@ impl Reservation {
             Ok(Self {
                 address,
                 stride,
+                pool: None,
                 region: kv::Reservation::new(bytes, granularity),
             })
         }
@@ -98,14 +177,23 @@ impl Reservation {
         self.grow_bytes(s, self.extent(tokens)?)
     }
     pub(crate) fn grow_bytes(&mut self, s: &Session, bytes: usize) -> Result<()> {
-        self.region.grow(
-            bytes,
-            &Ops {
-                session: s,
-                address: self.address,
-            },
-            true,
-        )?;
+        let extent = self.region.extent(bytes)?;
+        while self.mapped < extent {
+            let next = if self.pool.is_some() {
+                self.mapped + self.granularity
+            } else {
+                extent
+            };
+            self.region.grow(
+                next,
+                &Ops {
+                    session: s,
+                    address: self.address,
+                    pool: self.pool.as_ref(),
+                },
+                true,
+            )?;
+        }
         Ok(())
     }
     #[cfg(test)]
@@ -133,6 +221,7 @@ impl Reservation {
             s.owner,
             &Ops {
                 session: s,
+                pool: self.pool.as_ref(),
                 address: self.address,
             },
         )
@@ -159,6 +248,7 @@ impl Reservation {
             },
             &Ops {
                 session: s,
+                pool: self.pool.as_ref(),
                 address: self.address,
             },
         );
@@ -196,6 +286,7 @@ impl Reservation {
             range,
             &Ops {
                 session: s,
+                pool: self.pool.as_ref(),
                 address: self.address,
             },
         );
@@ -207,7 +298,14 @@ impl Reservation {
     pub(crate) fn release_slabs(&mut self, driver: &Driver) -> Result<()> {
         self.region.clear(
             |slab| unsafe_unmap(driver, self.address, slab),
-            |slab| unsafe_release(driver, slab.handle),
+            |slab| {
+                if let Some(pool) = &self.pool {
+                    pool.put(slab.handle);
+                    Ok(())
+                } else {
+                    unsafe_release(driver, slab.handle)
+                }
+            },
         )
     }
     pub(crate) fn has_slabs(&self) -> bool {
@@ -267,22 +365,23 @@ pub(crate) type Reservations = BTreeMap<String, Reservation>;
 /// CUDA calls only; allocation identities and COW/publication rules live in kv.
 struct Ops<'a> {
     session: &'a Session,
+    pool: Option<&'a Rc<PagePool>>,
     address: u64,
 }
 impl MappingOps for Ops<'_> {
     fn allocate(&self, bytes: usize) -> Result<u64> {
-        let mut handle = 0;
-        // SAFETY: Current session and valid physical allocation output.
-        unsafe {
-            check(
-                sys::cuMemCreate(&mut handle, bytes, &properties(self.session.device), 0),
-                "create KV physical allocation",
-            )?;
+        match self.pool {
+            Some(pool) => pool.take(bytes),
+            None => create_handle(self.session.device, bytes),
         }
-        Ok(handle)
     }
     fn release(&self, handle: u64, _bytes: usize) -> Result<()> {
-        unsafe_release(&self.session.driver, handle)
+        if let Some(pool) = self.pool {
+            pool.put(handle);
+            Ok(())
+        } else {
+            unsafe_release(&self.session.driver, handle)
+        }
     }
     fn map(&self, offset: usize, bytes: usize, handle: u64, _shared: bool) -> Result<()> {
         let address = self
@@ -368,6 +467,7 @@ impl MappingOps for Ops<'_> {
         used: usize,
     ) -> Result<Rc<crate::backend::snapshot::Allocation>> {
         let mut canonical = Reservation::reserve(self.session, page.bytes, 1)?;
+        canonical.pool = self.pool.cloned();
         let allocation = Rc::new(crate::backend::snapshot::Allocation {
             owner: self.session.owner,
             id: page.id,
@@ -387,6 +487,7 @@ impl MappingOps for Ops<'_> {
         });
         let ops = Ops {
             session: self.session,
+            pool: self.pool,
             address: canonical.address,
         };
         let result = ops.map(0, page.bytes, page.handle, true).and_then(|()| {
@@ -421,7 +522,9 @@ pub(crate) fn restore_host(
         return Err("Invalid CUDA CPU KV payload".into());
     }
     let mut canonical = Reservation::reserve(s, descriptor.bytes, 1)?;
+    canonical.pool = s.kv_pool.clone();
     let ops = Ops {
+        pool: canonical.pool.as_ref(),
         session: s,
         address: canonical.address,
     };
@@ -758,6 +861,7 @@ mod tests {
         assert!(round_up(usize::MAX, 2 << 20).is_err());
         assert!(round_up(1, 3).is_err());
         let r = Reservation {
+            pool: None,
             address: 0,
             stride: 2048,
             region: kv::Reservation::new(4 << 20, 2 << 20),
@@ -767,6 +871,7 @@ mod tests {
         assert!(r.extent(2049).is_err());
         assert_eq!(r.required_extent(2049).unwrap(), 6 << 20);
         let scale = Reservation {
+            pool: None,
             address: 0,
             stride: 32,
             region: kv::Reservation::new(8 << 20, 2 << 20),

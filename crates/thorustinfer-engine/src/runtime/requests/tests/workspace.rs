@@ -89,7 +89,7 @@ fn validate_lazy_workspace_requests() {
         // must retain that recording's still-unmapped shared working memory.
         let source = input(media[0], 4);
         let context = model.validate_generation(&source).unwrap();
-        let text_budget = model.pending_workspace(context, false, &[]).unwrap();
+        let text_budget = model.pending_workspace(context, 0, &[]).unwrap();
         let mut pending_media = model.start_request(source, &|| false).unwrap();
         let media_bytes = model
             .execution
@@ -97,12 +97,12 @@ fn validate_lazy_workspace_requests() {
             .unwrap();
         assert!(media_bytes > 0);
         assert_eq!(
-            model.pending_workspace(context, false, &[]).unwrap(),
+            model.pending_workspace(context, 0, &[]).unwrap(),
             text_budget + media_bytes
         );
         let mut later_text = model.start_request(input(text, 4), &|| false).unwrap();
         assert_eq!(
-            model.pending_workspace(context, false, &[]).unwrap(),
+            model.pending_workspace(context, 0, &[]).unwrap(),
             text_budget + media_bytes
         );
         model.finish_request(&mut later_text, false).unwrap();

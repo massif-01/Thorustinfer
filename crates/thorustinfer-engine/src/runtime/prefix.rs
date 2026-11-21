@@ -234,7 +234,7 @@ impl ModelRuntime {
         }
         let mut ranges = BTreeMap::new();
         for name in names {
-            if m.mtp.is_none() && mtp_kv.contains(&name) {
+            if self.native_mtp().is_none() && mtp_kv.contains(&name) {
                 continue;
             }
             let b = m
@@ -304,7 +304,7 @@ impl ModelRuntime {
         let at = Instant::now();
         let logits_valid = checkpoint != Checkpoint::Decoded;
         if self.prefix_enabled()
-            && self.manifest.mtp.is_some()
+            && self.native_mtp().is_some()
             && (input.is_empty() || warm_tokens != input.len() - 1)
         {
             return Err("Prefix checkpoint must retain exactly P-1 MTP inputs".into());
@@ -632,7 +632,7 @@ impl ModelRuntime {
     ) -> Result<()> {
         let position = self.read_control(&self.manifest.position)? as usize;
         if self.prefix_enabled() && !cancelled() && position != 0 && position <= history.len() {
-            let spec = self.manifest.mtp.clone();
+            let spec = self.native_mtp().cloned();
             let warm = if let Some(s) = &spec {
                 // The draft has already consumed the pending token's embedding.
                 // Cache only the prefix-consistent P-1 range; preserve the live cursor.

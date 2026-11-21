@@ -458,7 +458,7 @@ fn vision(m: &mut Manifest, depth: usize, hidden: usize) -> Result<()> {
     let Some(v) = m.vision.as_ref() else {
         return Ok(());
     };
-    if !matches!(depth, 24 | 27)
+    if !(matches!(depth, 24 | 27) || (depth == 12 && hidden == 1024))
         || v.hidden != hidden
         || v.max_patches > 32768
         || v.plans.len() != 1
@@ -586,6 +586,7 @@ pub(crate) fn create(mut request: CreateRequest) -> Result<crate::registry::Buil
             ),
             (5120, 17408, 64, 24, 4, 48, false)
                 | (4096, 12288, 32, 16, 4, 32, false)
+                | (1024, 3584, 24, 8, 2, 16, true)
                 | (2048, 6144, 24, 8, 2, 16, true)
                 | (2560, 9216, 32, 16, 4, 32, true)
                 | (2048, 512, 40, 16, 2, 32, false)
@@ -625,10 +626,9 @@ pub(crate) fn create(mut request: CreateRequest) -> Result<crate::registry::Buil
         && (m.target != "sm_110a"
             || t.hidden_size != 2560
             || t.intermediate_size != 9216
-            || t.num_hidden_layers != 32
-            || m.mtp.is_some())
+            || t.num_hidden_layers != 32)
     {
-        return Err("NVFP4 FFN requires the SM110a 4B non-speculative profile".into());
+        return Err("NVFP4 FFN requires the SM110a 4B profile".into());
     }
     if !c.standard && m.gdn_execution.is_none() {
         return Err("Missing explicit Qwen GDN execution contract".into());

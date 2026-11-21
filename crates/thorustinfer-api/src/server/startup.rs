@@ -49,12 +49,13 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
     let (ready_sender, ready_receiver) = oneshot::channel();
     let model_id: Arc<str> = settings.model.clone().into();
     let shutdown = Arc::new(AtomicBool::new(false));
-    let worker_model = Arc::clone(&model_id);
     let worker_shutdown = Arc::clone(&shutdown);
     let scheduler = settings.scheduler;
     let verify_weights = settings.verify_weights;
     let resident_experts = settings.resident_experts;
-    let prompt_lookup = settings.prompt_lookup;
+    let spec_method = settings.spec_method;
+    let prompt_lookup = settings.prompt_lookup
+        || settings.spec_method == Some(thorustinfer_engine::execution::SpecMethod::PromptLookup);
     let activity = Arc::new(continuous::Activity::default());
     let lifecycle = Arc::clone(&activity.lifecycle);
     let worker_activity = Arc::clone(&activity);
@@ -69,13 +70,18 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
             let _worker_lifetime = worker_lifetime;
             let _ = worker_lifecycle.supervise(|| {
                 let initialize = || -> Result<_> {
-                    let ((worker_codec, frontend_s), loaded) = load_parallel(
+                    let ((worker_codec, frontend_s), mut loaded) = load_parallel(
                         || {
                             let at = Instant::now();
                             load_frontend(&settings).map(|codec| (codec, at.elapsed().as_secs_f64()))
                         },
                         || load_model(&settings),
                     )?;
+                    let other_worker_bytes=std::env::var("THORUSTINFER_WORKER_PLANNING_BYTES").ok().map(|v|v.parse::<usize>()).transpose().map_err(|e|e.to_string())?.unwrap_or(0);
+                    let mut planning=scheduler;
+                    planning.memory_reserve_bytes=planning.memory_reserve_bytes.saturating_add(other_worker_bytes);
+                    let mut context_plan=loaded.model.configure_context(settings.context_options,&planning)?;
+                    context_plan.other_worker_bytes=other_worker_bytes;
                     let model = &loaded.model;
                     if &worker_codec.asset_hashes != model.frontend_assets() {
                         return Err("Declared frontend identities changed while loading model".into());
@@ -92,10 +98,10 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
                         "WORKER READY after {:.3}s; frontend={frontend_s:.3}s; model={:.3}s; parallel_load=true",
                         started.elapsed().as_secs_f64(), loaded.seconds
                     );
-                    Ok((loaded, context, vision, worker_codec))
+                    Ok((loaded, context, context_plan, vision, worker_codec))
                 };
                 match initialize() {
-                    Ok((mut loaded, context, vision, worker_codec)) => {
+                    Ok((mut loaded, context, context_plan, vision, worker_codec)) => {
                         // The first user request would otherwise pay lease
                         // mapping, packet plans and module loading: measured
                         // ~0.6s of extra first-prompt TTFT on Flash Next.
@@ -104,7 +110,7 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
                             temperature: 0.0,
                             ..Default::default()
                         };
-                        if let Err(error) =
+                        if context >= 2 && let Err(error) =
                             loaded.model.generate(&[0], 1, &greedy, || false, |_| true)
                         {
                             let message = format!("Model warmup failed: {error}");
@@ -118,17 +124,22 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
                             "WARMUP READY after {:.3}s",
                             warm_started.elapsed().as_secs_f64()
                         );
+                        let mut capacity=crate::capacity::Publisher::new(context_plan.clone());
+                        if let Err(error)=capacity.update(&loaded.model,0) {
+                            worker_lifecycle.fail(thorustinfer_engine::error::EngineError::take(error.clone(),true));
+                            let _=ready_sender.send(Err(error)); return;
+                        }
                         worker_lifecycle.ready();
                         let mtp_drafts = loaded.model.mtp_drafts();
-                        let ready = (context, vision, mtp_drafts, Arc::clone(&worker_codec));
+                        let ready = (context, context_plan, vision, mtp_drafts, Arc::clone(&worker_codec));
                         if ready_sender.send(Ok(ready)).is_ok() {
                             continuous::worker(
                                 &mut loaded.model,
                                 receiver,
                                 &worker_codec,
-                                &worker_model,
+                                &settings,
                                 &worker_shutdown,
-                                scheduler,
+                                capacity,
                                 &worker_activity,
                             );
                         }
@@ -152,7 +163,7 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
         .await
         .map_err(|e| e.to_string())
         .and_then(|r| r);
-    let (context, vision, mtp_drafts, codec) = match ready {
+    let (context, context_plan, vision, mtp_drafts, codec) = match ready {
         Ok(ready) => ready,
         Err(error) => {
             shutdown.store(true, Ordering::Relaxed);
@@ -169,7 +180,9 @@ pub(super) async fn start(settings: &Settings) -> Result<Worker> {
         codec,
         model: model_id,
         context,
+        context_plan,
         mtp_drafts,
+        spec_method,
         prompt_lookup,
         verify_weights,
         resident_experts,
@@ -218,18 +231,22 @@ fn load_model(settings: &Settings) -> Result<LoadedModel> {
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err("GPU experiment lock is busy".into());
     }
-    let model = Model::load_with_options(
+    let options = LoadOptions {
+        cuda_graph: settings.cuda_graph,
+        verify_weights: settings.verify_weights,
+        load_workers: settings.load_workers,
+        resident_experts: settings.resident_experts,
+        prefix_cache_bytes: settings.prefix_cache_bytes,
+        kv_offload_bytes: settings.kv_offload_bytes,
+        mtp_drafts: settings.mtp_drafts,
+        spec_method: settings.spec_method,
+        prompt_lookup: settings.prompt_lookup,
+    };
+    let model = Model::load_with_draft(
         &settings.model_dir,
-        LoadOptions {
-            cuda_graph: settings.cuda_graph,
-            verify_weights: settings.verify_weights,
-            load_workers: settings.load_workers,
-            resident_experts: settings.resident_experts,
-            prefix_cache_bytes: settings.prefix_cache_bytes,
-            kv_offload_bytes: settings.kv_offload_bytes,
-            mtp_drafts: settings.mtp_drafts,
-            prompt_lookup: settings.prompt_lookup,
-        },
+        options,
+        settings.draft_model.as_deref(),
+        settings.draft_confidence,
     )?;
     Ok(LoadedModel {
         model,
